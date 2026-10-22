@@ -1,0 +1,6 @@
+# 本机配置含访问令牌，不入库；默认配置由 MaiBot 按 config_model 自动生成
+config.toml
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
