@@ -50,8 +50,8 @@ url = "http://127.0.0.1:8767/mcp"
 headers = { Authorization = "Bearer <同一个令牌>" }
 ```
 
-通用 MCP 工具在 Amaidesu 里默认只对主播可见。Amaidesu 启动时连不上本服务会跳过这组工具，
-需要在 MaiBot 运行后重启 Amaidesu。
+通用 MCP 工具在 Amaidesu 里默认只对主播可见。Amaidesu 启动时连不上本服务会先占位登记，
+后台按 5 秒起步、60 秒封顶的间隔重试，MaiBot 上线后自动补上这组工具，不用重启。
 
 ## 开发
 
