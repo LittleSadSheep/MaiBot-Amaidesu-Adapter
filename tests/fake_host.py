@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from maibot_sdk import PluginContext, PluginPaths
 
+import importlib
 import importlib.util
 import sys
 import tempfile
@@ -42,17 +43,10 @@ def load_plugin_package() -> ModuleType:
 
 
 def load_bridge_module() -> ModuleType:
-    """业务逻辑只依赖标准库，单独导入即可，不经过插件入口。"""
+    """桥接逻辑经包导入（它相对导入 errors / recall），与插件加载器一致。"""
 
-    name = "amaidesu_bridge_logic_under_test"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, PLUGIN_DIR / "bridge.py")
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+    load_plugin_package()
+    return importlib.import_module(f"{PACKAGE_NAME}.bridge")
 
 
 class FakeHost:
@@ -72,9 +66,38 @@ class FakeHost:
         # 宿主全局配置里与读群署名提示相关的键（点分键 → 值）。
         self.config: Dict[str, Any] = {"bot.nickname": "麦麦", "bot.alias_names": []}
         self.data_dir = Path(tempfile.mkdtemp(prefix="amaidesu-bridge-test-"))
+        # 人物库：person_id → 字段；称呼 → person_id；(平台, QQ 号) → person_id
+        self.people: Dict[str, Dict[str, Any]] = {}
+        self.person_names: Dict[str, str] = {}
+        self.person_ids: Dict[Tuple[str, str], str] = {}
+        # 长期记忆：检索键（有人物过滤时用 person_id，否则用查询词）→ 正文
+        self.knowledge: Dict[str, str] = {}
+        self.knowledge_fails = False
 
-    def add_message(self, timestamp_s: float, text: str, stream_id: str = STREAM_ID) -> None:
-        self.messages.setdefault(stream_id, []).append({"timestamp": str(timestamp_s), "text": text})
+    def add_person(self, person_id: str, user_id: str, **fields: Any) -> None:
+        """登记一个 MaiBot 认识的人；fields 为人物字段（person_name / nickname / group_cardname_list 等）。"""
+
+        self.people[person_id] = {"is_known": True, **fields}
+        if fields.get("person_name"):
+            self.person_names[fields["person_name"]] = person_id
+        self.person_ids[("qq", user_id)] = person_id
+
+    def add_message(
+        self,
+        timestamp_s: float,
+        text: str,
+        stream_id: str = STREAM_ID,
+        *,
+        user_id: str = "",
+        nickname: str = "",
+        cardname: str = "",
+    ) -> None:
+        message: Dict[str, Any] = {"timestamp": str(timestamp_s), "text": text}
+        if user_id:
+            message["message_info"] = {
+                "user_info": {"user_id": user_id, "user_nickname": nickname, "user_cardname": cardname}
+            }
+        self.messages.setdefault(stream_id, []).append(message)
 
     def calls_of(self, capability: str) -> List[Dict[str, Any]]:
         return [args for name, args in self.calls if name == capability]
@@ -124,6 +147,28 @@ class FakeHost:
     def _frequency_set_adjust(self, args: Dict[str, Any]) -> Dict[str, Any]:
         self.adjust[args["chat_id"]] = float(args["value"])
         return {"success": True}
+
+    def _knowledge_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if self.knowledge_fails:
+            return {"success": False, "error": "长期记忆未启用"}
+        content = self.knowledge.get(args.get("person_id") or args["query"])
+        return {"success": True, "content": content or f"你不太了解有关{args['query']}的知识"}
+
+    def _person_get_id_by_name(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        return {"success": True, "person_id": self.person_names.get(args["person_name"], "")}
+
+    def _person_get_id(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        # 宿主按平台与 QQ 号算出固定的人物 ID，不认识的人也有 ID，只是 is_known 为假
+        key = (args["platform"], str(args["user_id"]))
+        return {"success": True, "person_id": self.person_ids.get(key, f"unknown-{args['user_id']}")}
+
+    def _person_get_value(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        person = self.people.get(args["person_id"])
+        if person is None:
+            if args["field_name"] == "is_known":
+                return {"success": True, "value": False}
+            return {"success": False, "error": "人物不存在"}
+        return {"success": True, "value": person.get(args["field_name"])}
 
     def _config_get(self, args: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": True, "value": self.config.get(args["key"], args.get("default"))}

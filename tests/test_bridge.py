@@ -207,7 +207,7 @@ def test_call_tool_coerces_model_arguments() -> None:
 def test_tool_definitions_list_configured_groups() -> None:
     bridge, _, _ = make_bridge(takeover_duration_ms=5 * MINUTE_MS)
     definitions = {item.name: item for item in bridge.tool_definitions()}
-    assert set(definitions) == {"read_group", "send_group", "ask_mai"}
+    assert set(definitions) == {"read_group", "send_group", "ask_mai", "recall_memory", "recall_person"}
     assert GROUP_ID in definitions["send_group"].input_schema["properties"]["group_id"]["description"]
     assert "约 5 分钟" in definitions["send_group"].description
     assert definitions["ask_mai"].input_schema["required"] == ["intent"]

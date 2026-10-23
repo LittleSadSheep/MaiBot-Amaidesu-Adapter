@@ -80,6 +80,12 @@ class QQConfig(PluginConfigBase):
     max_text_length: int = Field(default=300, ge=1, le=4000, description="主播单条发群消息的字数上限")
     min_send_interval_ms: int = Field(default=2000, ge=0, description="同一个群两次发群的最短间隔，毫秒")
     max_intent_length: int = Field(default=1000, ge=1, le=8000, description="请 QQ 麦麦说话时意图说明的字数上限")
+    person_lookup_days: int = Field(
+        default=30,
+        ge=1,
+        le=365,
+        description="回想某个群友时，按群名片 / 昵称在这个群最近多少天的发言里找人",
+    )
 
 
 class TakeoverConfig(PluginConfigBase):
@@ -160,6 +166,7 @@ def build_bridge_settings(config: AmaidesuBridgeConfig) -> BridgeSettings:
         max_text_length=config.qq.max_text_length,
         min_send_interval_ms=config.qq.min_send_interval_ms,
         max_intent_length=config.qq.max_intent_length,
+        person_lookup_days=config.qq.person_lookup_days,
         takeover_enabled=config.takeover.enabled,
         takeover_talk_adjust=config.takeover.talk_adjust,
         takeover_duration_ms=config.takeover.duration_ms,

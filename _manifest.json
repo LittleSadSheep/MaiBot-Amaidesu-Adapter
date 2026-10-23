@@ -28,7 +28,11 @@
     "frequency.get_adjust",
     "frequency.set_adjust",
     "maisaka.proactive.trigger",
-    "config.get"
+    "config.get",
+    "knowledge.search",
+    "person.get_id",
+    "person.get_id_by_name",
+    "person.get_value"
   ],
   "i18n": {
     "default_locale": "zh-CN",

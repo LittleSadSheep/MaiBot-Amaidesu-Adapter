@@ -67,7 +67,13 @@ def test_plugin_serves_tools_over_mcp_and_restores_on_unload() -> None:
                     ("read_group", {"group_id": "424242"}),
                 ],
             )
-            assert {tool.name for tool in tools.tools} == {"read_group", "send_group", "ask_mai"}
+            assert {tool.name for tool in tools.tools} == {
+                "read_group",
+                "send_group",
+                "ask_mai",
+                "recall_memory",
+                "recall_person",
+            }
             sent, rejected = results
             assert not sent.isError and "已发到" in sent.content[0].text
             assert rejected.isError and "不在允许名单" in rejected.content[0].text
@@ -107,7 +113,7 @@ def test_config_update_restarts_server_only_when_endpoint_changes() -> None:
             await plugin.on_config_update("self", {}, "1.0.0")
             assert plugin._server is not first_server
             tools, _ = await call_tools(url, "rotated", [])
-            assert len(tools.tools) == 3
+            assert len(tools.tools) == 5
             async with httpx.AsyncClient() as client:
                 old = await client.post(url, json={}, headers={"Authorization": f"Bearer {TOKEN}"})
             assert old.status_code == 401

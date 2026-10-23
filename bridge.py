@@ -1,8 +1,9 @@
 """Amaidesu 主播使用的 QQ 群能力。
 
-直播那边的麦麦（Amaidesu 主播）通过本插件的 MCP 服务调用三件事：
+直播那边的麦麦（Amaidesu 主播）通过本插件的 MCP 服务调用这些事：
 读群（看看群里在聊什么）、发群（直播时水群）、请 QQ 麦麦说话（交代意图，
-由常驻 QQ 的麦麦用自己的群聊语气表达，例如开播前喊人）。
+由常驻 QQ 的麦麦用自己的群聊语气表达，例如开播前喊人），以及回想 QQ 那边
+记下的事和对某个群友的印象（逻辑在 ``recall.py``）。所有操作只限允许名单里的群。
 
 同一个 QQ 号背后有两个决策循环：主播在直播里水群时，MaiBot 自己的群聊循环
 也在看同一个群。为避免两边抢话，主播发群后本模块会在一段时间内压低 MaiBot
@@ -16,13 +17,12 @@ import asyncio
 import logging
 import time
 
+from .errors import ToolCallError
+from .recall import recall_memory, recall_person
+
 
 # 主播发出的消息写进 MaiBot 群上下文时使用的来源标记，便于在 MaiBot 日志与上下文里辨认。
 SEND_SOURCE_KIND = "amaidesu_bridge"
-
-
-class ToolCallError(Exception):
-    """工具调用失败，消息文本会原样返回给调用方的模型。"""
 
 
 @dataclass(frozen=True)
@@ -37,6 +37,7 @@ class BridgeSettings:
     max_text_length: int = 300
     min_send_interval_ms: int = 2000
     max_intent_length: int = 1000
+    person_lookup_days: int = 30
     takeover_enabled: bool = True
     takeover_talk_adjust: float = 0.0
     takeover_duration_ms: int = 10 * 60 * 1000
@@ -198,6 +199,37 @@ class QQBridge:
                     "required": ["intent"],
                 },
             ),
+            _ToolDefinition(
+                name="recall_memory",
+                description=(
+                    "回想 QQ 那边的你在群里记下的事（长期记忆），比如群友聊过的梗、约定、某件事的来龙去脉。"
+                    "只查这个群自己的记忆，私聊里的事不会查出来——直播间是公开场合。"
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "想回想的事（关键词或一句话）"},
+                        "group_id": group_property,
+                    },
+                    "required": ["query"],
+                },
+            ),
+            _ToolDefinition(
+                name="recall_person",
+                description=(
+                    "回想 QQ 那边的你对某个群友的印象：怎么称呼他、认识多久、来往几次，以及他在这个群里的相关记忆。"
+                    f"名字可以直接用群聊记录里看到的群名片或昵称（会在最近 {settings.person_lookup_days} 天的群发言里找）。"
+                    "只查这个群范围内的事，私聊里的事不会查出来。"
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "群友的群名片、QQ 昵称，或 QQ 那边的你对他的称呼"},
+                        "group_id": group_property,
+                    },
+                    "required": ["name"],
+                },
+            ),
         ]
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Tuple[str, bool]:
@@ -219,6 +251,19 @@ class QQBridge:
                 text = await self.ask_mai(
                     intent=_as_text(arguments.get("intent")),
                     group_id=_as_text(arguments.get("group_id")),
+                )
+            elif name == "recall_memory":
+                scope = await self._resolve_group(_as_text(arguments.get("group_id")))
+                text = await recall_memory(self._ctx, scope, _as_text(arguments.get("query")))
+            elif name == "recall_person":
+                scope = await self._resolve_group(_as_text(arguments.get("group_id")))
+                text = await recall_person(
+                    self._ctx,
+                    scope,
+                    _as_text(arguments.get("name")),
+                    platform=self._settings.platform,
+                    lookup_days=self._settings.person_lookup_days,
+                    now_ms=self._clock_ms(),
                 )
             else:
                 raise ToolCallError(f"没有名为 {name} 的工具")
