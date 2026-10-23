@@ -7,12 +7,13 @@
 
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from maibot_sdk import PluginContext, PluginPaths
 
 import importlib
 import importlib.util
+import inspect
 import sys
 import tempfile
 
@@ -73,6 +74,15 @@ class FakeHost:
         # 长期记忆：检索键（有人物过滤时用 person_id，否则用查询词）→ 正文
         self.knowledge: Dict[str, str] = {}
         self.knowledge_fails = False
+        # 直播间回放：网关就绪声明、入站消息是否被接受、入库是否延后（宿主是在后台入库的）
+        self.gateway_states: List[Dict[str, Any]] = []
+        self.route_accept = True
+        self.defer_store = False
+        self._unstored: List[Tuple[str, Dict[str, Any]]] = []
+        # 设置后 send.text 交给它处理：模拟宿主"构建消息 → 发送钩子 → 网关 → 入库"的发送链路
+        self.send_pipeline: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None
+        # 每次 send.text 时目标会话已入库的消息条数（检查回放是否先等观众消息入库）
+        self.stored_count_at_send: List[int] = []
 
     def add_person(self, person_id: str, user_id: str, **fields: Any) -> None:
         """登记一个 MaiBot 认识的人；fields 为人物字段（person_name / nickname / group_cardname_list 等）。"""
@@ -111,13 +121,49 @@ class FakeHost:
         self, method: str, plugin_id: str, payload: Optional[Dict[str, Any]], timeout_ms: Optional[int] = None
     ) -> Any:
         del plugin_id, timeout_ms
-        assert method == "cap.call"
         assert payload is not None
+        if method == "host.update_message_gateway_state":
+            self.gateway_states.append(dict(payload))
+            return {"accepted": True, "ready": bool(payload.get("ready"))}
+        if method == "host.route_message":
+            self.calls.append((method, dict(payload)))
+            return self._route_message(payload)
+        assert method == "cap.call"
         capability = str(payload["capability"])
         args = dict(payload["args"])
         self.calls.append((capability, args))
         handler = getattr(self, "_" + capability.replace(".", "_"))
-        return handler(args)
+        result = handler(args)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    def _route_message(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """网关送入一条消息：第一次见到这个群就建会话，再按原始时间入库。"""
+
+        if not self.route_accept:
+            return {"accepted": False}
+        message = payload["message"]
+        group = message["message_info"]["group_info"]
+        stream = self.streams.setdefault(
+            group["group_id"],
+            {
+                "stream_id": f"stream-{group['group_id']}",
+                "group_id": group["group_id"],
+                "group_name": group["group_name"],
+            },
+        )
+        stored = {
+            "timestamp": message["timestamp"],
+            "text": message["raw_message"][0]["data"],
+            "message_id": message["message_id"],
+            "message_info": {"user_info": message["message_info"]["user_info"]},
+        }
+        if self.defer_store:
+            self._unstored.append((stream["stream_id"], stored))
+        else:
+            self.messages.setdefault(stream["stream_id"], []).append(stored)
+        return {"accepted": True}
 
     def _chat_get_stream_by_group_id(self, args: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": True, "stream": self.streams.get(str(args["group_id"]))}
@@ -129,12 +175,19 @@ class FakeHost:
         limit = int(args.get("limit", 0))
         if limit > 0:
             matched = matched[-limit:]
+        # 延后入库：这次查询看不到，下一次才看得到
+        for stream_id, stored in self._unstored:
+            self.messages.setdefault(stream_id, []).append(stored)
+        self._unstored.clear()
         return {"success": True, "messages": matched}
 
     def _message_build_readable(self, args: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": True, "text": "\n".join(m["text"] for m in args["messages"])}
 
-    def _send_text(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _send_text(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        self.stored_count_at_send.append(len(self.messages.get(args["stream_id"], [])))
+        if self.send_pipeline is not None:
+            return await self.send_pipeline(args)
         if not self.send_ok:
             return {"success": False, "sent": False, "message_id": None, "error": "适配器未连接"}
         return {"success": True, "sent": True, "message_id": "m1"}
