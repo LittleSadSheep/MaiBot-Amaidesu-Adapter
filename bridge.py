@@ -95,7 +95,7 @@ class QQBridge:
     """读群、发群、请 QQ 麦麦说话，以及水群期间的发言权接管。
 
     ``ctx`` 是 MaiBot SDK 注入的插件上下文（只用到 chat / message / send /
-    frequency / maisaka 五组能力），测试中可替换为假实现。
+    frequency / maisaka / config 六组能力），测试中可替换为假实现。
     """
 
     def __init__(
@@ -147,8 +147,8 @@ class QQBridge:
                 name="read_group",
                 description=(
                     "读取 QQ 群的聊天记录，看看群友在聊什么。默认只返回你上次查看之后的新消息"
-                    "（第一次查看返回最近一段时间的消息）。记录里的「你」指 QQ 那边的你自己，"
-                    "和你是同一个麦麦。"
+                    "（第一次查看返回最近一段时间的消息）。QQ 那边的你和你是同一个麦麦，"
+                    "记录开头会说明哪个署名是你自己。"
                 ),
                 input_schema={
                     "type": "object",
@@ -269,10 +269,31 @@ class QQBridge:
 
         scope = "上次查看之后的新消息" if cursor is not None else "最近的消息"
         lines = [f"{target.label}{scope}（{len(messages)} 条）："]
+        if self_hint := await self._self_signature_hint():
+            lines.append(self_hint)
         if len(messages) >= count:
             lines.append(f"（只显示最近 {count} 条，更早的没有显示）")
         lines.append(readable.strip())
         return "\n".join(lines)
+
+    async def _self_signature_hint(self) -> str:
+        """说明记录里哪个署名是 QQ 那边的你自己。
+
+        MaiBot 整理记录时只把正文里的机器人名换成「你」，发言署名仍是机器人昵称；
+        不点明的话，主播会把自己在 QQ 上说过的话当成群友的话去接。每次读群现取配置，
+        MaiBot 改了昵称或别名也不会过时；读不到昵称时不加这行。
+        """
+
+        nickname = await self._ctx.config.get("bot.nickname", "")
+        if not isinstance(nickname, str) or not nickname.strip():
+            return ""
+        hint = f"（署名「{nickname.strip()}」的发言是 QQ 那边的你自己"
+        aliases = await self._ctx.config.get("bot.alias_names", [])
+        if isinstance(aliases, list):
+            names = [str(item).strip() for item in aliases if str(item).strip()]
+            if names:
+                hint += f"；群友也可能叫你{'、'.join(names)}"
+        return hint + "）"
 
     async def send_group(self, text: str, group_id: str = "") -> str:
         """发群：校验长度与间隔 → 发送并同步进 MaiBot 群上下文 → 接管该群发言权。"""

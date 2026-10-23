@@ -36,6 +36,7 @@ def test_first_read_uses_lookback_then_only_new_messages() -> None:
     first = run(bridge.read_group())
     assert GROUP_NAME in first and "最近的消息（1 条）" in first
     assert "今晚播吗" in first and "旧消息" not in first
+    assert "署名「麦麦」的发言是 QQ 那边的你自己" in first and "群友也可能叫你" not in first
 
     clock.advance(MINUTE_MS)
     assert "自上次查看以来没有新消息" in run(bridge.read_group())
@@ -45,6 +46,17 @@ def test_first_read_uses_lookback_then_only_new_messages() -> None:
     second = run(bridge.read_group())
     assert "上次查看之后的新消息（1 条）" in second
     assert "来了来了" in second and "今晚播吗" not in second
+
+
+def test_read_names_aliases_and_omits_hint_without_nickname() -> None:
+    bridge, host, clock = make_bridge()
+    host.add_message(clock.now_ms / 1000 - 10, "群友A: @昔涟 在吗")
+    host.config["bot.alias_names"] = ["昔涟", " "]
+    assert "署名「麦麦」的发言是 QQ 那边的你自己；群友也可能叫你昔涟）" in run(bridge.read_group())
+
+    host.config["bot.nickname"] = ""
+    text = run(bridge.read_group(only_new=False))
+    assert "署名" not in text and "在吗" in text
 
 
 def test_read_without_only_new_rereads_recent_and_marks_truncation() -> None:

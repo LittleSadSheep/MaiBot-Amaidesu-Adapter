@@ -27,7 +27,8 @@
     "send.text",
     "frequency.get_adjust",
     "frequency.set_adjust",
-    "maisaka.proactive.trigger"
+    "maisaka.proactive.trigger",
+    "config.get"
   ],
   "i18n": {
     "default_locale": "zh-CN",

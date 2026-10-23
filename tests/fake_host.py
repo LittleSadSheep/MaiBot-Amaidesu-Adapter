@@ -68,6 +68,8 @@ class FakeHost:
         self.send_ok = True
         self.get_adjust_fails = False
         self.trigger_result: Dict[str, Any] = {"success": True, "stream_id": STREAM_ID, "task_id": "t1", "queued": True}
+        # 宿主全局配置里与读群署名提示相关的键（点分键 → 值）。
+        self.config: Dict[str, Any] = {"bot.nickname": "麦麦", "bot.alias_names": []}
 
     def add_message(self, timestamp_s: float, text: str, stream_id: str = STREAM_ID) -> None:
         self.messages.setdefault(stream_id, []).append({"timestamp": str(timestamp_s), "text": text})
@@ -118,6 +120,9 @@ class FakeHost:
     def _frequency_set_adjust(self, args: Dict[str, Any]) -> Dict[str, Any]:
         self.adjust[args["chat_id"]] = float(args["value"])
         return {"success": True}
+
+    def _config_get(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        return {"success": True, "value": self.config.get(args["key"], args.get("default"))}
 
     def _maisaka_proactive_trigger(self, args: Dict[str, Any]) -> Dict[str, Any]:
         del args
