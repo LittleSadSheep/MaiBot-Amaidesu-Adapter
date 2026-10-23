@@ -192,7 +192,7 @@ class LiveStatusStore:
         now_ms = self._clock_ms()
         snapshot = self._snapshot
         if snapshot is not None and snapshot.live:
-            platform = _platform_name(snapshot.platform)
+            platform = platform_name(snapshot.platform)
             if now_ms - self._snapshot_received_ms > self._settings.stale_after_ms:
                 return (
                     f"你{_clock(snapshot.started_at_ms, now_ms)} 在{platform}开了一场直播（你自己是主播）"
@@ -233,7 +233,7 @@ class LiveStatusStore:
                 snapshot.title,
                 snapshot.started_at_ms,
                 snapshot.ended_at_ms,
-                _platform_name(snapshot.platform),
+                platform_name(snapshot.platform),
             )
         elif self._recaps:
             recap = self._recaps[0]
@@ -250,7 +250,7 @@ class LiveStatusStore:
         return f"（{when}）{recap.text}"
 
 
-def _platform_name(platform: str) -> str:
+def platform_name(platform: str) -> str:
     """平台标识换成口语名（bilibili → B站）；未知平台原样，空串表示不提平台。"""
 
     return _PLATFORM_NAMES.get(platform.lower(), platform)

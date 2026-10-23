@@ -1,7 +1,7 @@
 # AmaidesuBridgePlugin
 
 让 Amaidesu 的直播主播和常驻 QQ 的麦麦互通：主播能读写 QQ 群、请 QQ 麦麦说话；QQ 麦麦
-知道自己在直播那边正在播什么、刚播完什么。MaiBot 7×24 运行，Amaidesu 用时才启动，所以由
+知道自己在直播那边正在播什么、刚播完什么，直播内容也能进它的长期记忆。MaiBot 7×24 运行，Amaidesu 用时才启动，所以由
 本插件在 MaiBot 插件进程里开一个服务（MCP 用 Streamable HTTP，另有一个 JSON 接口），
 Amaidesu 按需连入。
 
@@ -51,6 +51,54 @@ Amaidesu 开启 `[maibot_sync]` 后，把开播、换环节、收播与场次回
   数据来自缓存，Amaidesu 没开也能答。
 
 规划前的钩子每次都会收到整份上下文（这是 MaiBot 钩子的设计）；没有近况时立即原样放行。
+
+## 直播进记忆（暂定方案）
+
+开启 `live_memory.enabled` 后，Amaidesu 每场回顾写好时把整场记录（观众弹幕与付费留言、联动对象
+发言、主播发言）推到同一个 `/live-status`（`type="transcript"`）。插件把它按原始时间回放进一个
+固定的直播间会话（平台 + 房间号当群号，群名为"B站直播间"这类），由 MaiBot 自己的聊天摘要吸收
+进长期记忆。
+
+MaiBot 只在麦麦自己在某个会话里发出消息后才检查要不要写聊天摘要，所以回放时：
+
+- 观众、联动对象的话经插件的消息网关 `amaidesu_live_room` 作为入站消息送入，带原始时间；
+- 主播的话由插件以麦麦身份发进同一会话（连续几句合成一条，不超过 `live_memory.merge_chars` 字）。
+  网关发送端不外发、只回成功，`send_service.after_build_message` 钩子把这条消息的时间改回原始时刻；
+- 回放前把该会话的发言频率倍率设为 0：MaiBot 只静默接收、不进规划器。网关发送端只认正在回放
+  的那一条，麦麦自己想在直播间说的话一律回失败，不会发出、也不会入库。
+
+回放任务与进度存在插件数据目录的 `live_memory/` 下，插件或 MaiBot 重启后接着放；放完的场次记下
+编号，Amaidesu 重复推送时直接忽略。卡住的场次（如名单没放行）留在队列里，Amaidesu 再推同一场或
+下一场推来时重试。
+
+要让 QQ 那边查得到直播记忆，MaiBot 侧还要改两处配置（不改源码）：
+
+```toml
+# config/adapter_policy.toml：放行本插件的直播间网关（群号 = 直播间房间号）
+[[adapters]]
+plugin_id = "amaidesu.amaidesu-bridge-plugin"
+platform = "bilibili"
+
+[adapters.group]
+allow_ids = ["<房间号>"]
+```
+
+```toml
+# config/bot_config.toml：把直播间和要互通的 QQ 群、私聊编进同一个共享记忆组
+[[a_memorix.shared_memory_groups]]
+targets = [
+    { platform = "bilibili", item_id = "<房间号>", rule_type = "group" },
+    { platform = "qq", item_id = "<群号>", rule_type = "group" },
+]
+```
+
+共享记忆组只认已经存在的会话：直播间会话在第一次回放后才出现。另外几点：
+
+- 直播间会话第一次建立（或闲置被 MaiBot 回收后重建）时，第一条观众消息可能赶在倍率设为 0
+  之前触发一次规划；想彻底避免，可在 `chat.reply_timing.talk_value_rules` 里把直播间的发言频率设为 0。
+- 聊天摘要每次只总结最近 `a_memorix.integration.chat_summary_writeback_context_length` 条（默认 36）。
+  主播长时间不说话、其间弹幕超过这个数时，多出的部分不进摘要；调大它能缓解，对 QQ 群同样生效。
+- 麦麦每发一条消息，MaiBot 都会对最近说话的人做一次人物事实提取，一场回放会有几十到上百次模型调用。
 
 ## 配置
 
