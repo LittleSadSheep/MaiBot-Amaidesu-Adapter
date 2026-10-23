@@ -10,7 +10,7 @@ from fake_host import load_plugin_package
 
 
 load_plugin_package()
-import amaidesu_bridge_plugin_under_test.live_status as live_status  # noqa: E402
+import amaidesu_adapter_under_test.live_status as live_status  # noqa: E402
 
 ValidationError = pytest.importorskip("pydantic").ValidationError
 

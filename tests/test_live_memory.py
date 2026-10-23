@@ -10,7 +10,7 @@ from fake_host import FakeHost, load_plugin_package
 
 
 plugin_module = load_plugin_package()
-import amaidesu_bridge_plugin_under_test.live_memory as live_memory  # noqa: E402
+import amaidesu_adapter_under_test.live_memory as live_memory  # noqa: E402
 
 ROOM_ID = "778899"
 LIVE_STREAM = f"stream-{ROOM_ID}"

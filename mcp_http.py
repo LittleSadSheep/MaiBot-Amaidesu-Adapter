@@ -81,7 +81,7 @@ class BridgeMcpServer:
         self._list_tools = list_tools
         self._call_tool = call_tool
         self._json_posts = dict(json_posts or {})
-        self._logger = logger or logging.getLogger("plugin.amaidesu_bridge")
+        self._logger = logger or logging.getLogger("plugin.amaidesu_adapter")
         self._server: Optional[_EmbeddedUvicornServer] = None
         self._task: Optional[asyncio.Task[None]] = None
         self._socket: Optional[socket.socket] = None
@@ -105,7 +105,7 @@ class BridgeMcpServer:
     def _build_app(self) -> Starlette:
         """每次启动都新建会话管理器：它的 run() 一个实例只能进入一次。"""
 
-        server: Server = Server("amaidesu-bridge")
+        server: Server = Server("amaidesu-adapter")
         list_tools_fn = self._list_tools
         call_tool_fn = self._call_tool
 
@@ -197,20 +197,20 @@ class BridgeMcpServer:
         app = self._build_app()
         config = uvicorn.Config(app, log_config=None, access_log=False, log_level="warning", ws="none", lifespan="on")
         self._server = _EmbeddedUvicornServer(config)
-        self._task = asyncio.create_task(self._server.serve(sockets=[sock]), name="amaidesu_bridge.mcp")
+        self._task = asyncio.create_task(self._server.serve(sockets=[sock]), name="amaidesu_adapter.mcp")
         try:
             await asyncio.wait_for(self._wait_started(), _START_TIMEOUT_S)
         except BaseException:
             await self.stop()
             raise
-        self._logger.info(f"Amaidesu 桥接 MCP 服务已启动: {self.url}")
+        self._logger.info(f"Amaidesu 适配器 MCP 服务已启动: {self.url}")
 
     async def _wait_started(self) -> None:
         assert self._server is not None and self._task is not None
         while not self._server.started:
             if self._task.done():
                 await self._task
-                raise RuntimeError("Amaidesu 桥接 MCP 服务未能启动")
+                raise RuntimeError("Amaidesu 适配器 MCP 服务未能启动")
             await asyncio.sleep(0.01)
 
     async def stop(self) -> None:
@@ -228,7 +228,7 @@ class BridgeMcpServer:
                 except asyncio.CancelledError:
                     pass
             except Exception as exc:
-                self._logger.error(f"Amaidesu 桥接 MCP 服务退出时出错: {exc}", exc_info=True)
+                self._logger.error(f"Amaidesu 适配器 MCP 服务退出时出错: {exc}", exc_info=True)
         if self._socket is not None:
             self._socket.close()
         self._server = None

@@ -179,7 +179,7 @@ class LiveRoomReplayer:
         self._done_path = data_dir / "live_memory" / "done.json"
         self._settings = settings
         self._gateway_name = gateway_name
-        self._logger = logger or logging.getLogger("plugin.amaidesu_bridge")
+        self._logger = logger or logging.getLogger("plugin.amaidesu_adapter")
         self._wakeup = asyncio.Event()
         self._worker: Optional[asyncio.Task[None]] = None
         self._pending_out: Optional[_PendingOutbound] = None
@@ -197,7 +197,7 @@ class LiveRoomReplayer:
         """起后台回放；上次没放完的任务（插件或 MaiBot 重启前留下的）接着放。"""
 
         if self._worker is None or self._worker.done():
-            self._worker = asyncio.create_task(self._run(), name="amaidesu_bridge.live_memory")
+            self._worker = asyncio.create_task(self._run(), name="amaidesu_adapter.live_memory")
         if self._pending_job_paths():
             self._wakeup.set()
 

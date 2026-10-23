@@ -22,7 +22,7 @@ from .recall import recall_memory, recall_person
 
 
 # 主播发出的消息写进 MaiBot 群上下文时使用的来源标记，便于在 MaiBot 日志与上下文里辨认。
-SEND_SOURCE_KIND = "amaidesu_bridge"
+SEND_SOURCE_KIND = "amaidesu_adapter"
 
 
 @dataclass(frozen=True)
@@ -109,7 +109,7 @@ class QQBridge:
     ) -> None:
         self._ctx = ctx
         self._settings = settings
-        self._logger = logger or logging.getLogger("plugin.amaidesu_bridge")
+        self._logger = logger or logging.getLogger("plugin.amaidesu_adapter")
         self._clock_ms = clock_ms
         # 每个群聊流的已读位置（毫秒）：主播看过之后，下次默认只给新消息。
         self._read_cursors: Dict[str, int] = {}

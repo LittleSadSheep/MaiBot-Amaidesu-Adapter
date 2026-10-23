@@ -19,7 +19,7 @@ import tempfile
 
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
-PACKAGE_NAME = "amaidesu_bridge_plugin_under_test"
+PACKAGE_NAME = "amaidesu_adapter_under_test"
 
 GROUP_ID = "10001"
 STREAM_ID = "stream-10001"
@@ -66,7 +66,7 @@ class FakeHost:
         self.trigger_result: Dict[str, Any] = {"success": True, "stream_id": STREAM_ID, "task_id": "t1", "queued": True}
         # 宿主全局配置里与读群署名提示相关的键（点分键 → 值）。
         self.config: Dict[str, Any] = {"bot.nickname": "麦麦", "bot.alias_names": []}
-        self.data_dir = Path(tempfile.mkdtemp(prefix="amaidesu-bridge-test-"))
+        self.data_dir = Path(tempfile.mkdtemp(prefix="amaidesu-adapter-test-"))
         # 人物库：person_id → 字段；称呼 → person_id；(平台, QQ 号) → person_id
         self.people: Dict[str, Dict[str, Any]] = {}
         self.person_names: Dict[str, str] = {}
@@ -112,7 +112,7 @@ class FakeHost:
     def calls_of(self, capability: str) -> List[Dict[str, Any]]:
         return [args for name, args in self.calls if name == capability]
 
-    def make_context(self, plugin_id: str = "amaidesu.amaidesu-bridge-plugin") -> PluginContext:
+    def make_context(self, plugin_id: str = "amaidesu.amaidesu-adapter") -> PluginContext:
         # 插件数据目录放临时目录：近况缓存等落盘文件不写进仓库
         paths = PluginPaths(data_dir=self.data_dir, runtime_dir=self.data_dir / "runtime")
         return PluginContext(plugin_id, rpc_call=self.rpc, paths=paths)

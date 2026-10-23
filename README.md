@@ -1,4 +1,4 @@
-# AmaidesuBridgePlugin
+# MaiBot-Amaidesu-Adapter
 
 让 Amaidesu 的直播主播和常驻 QQ 的麦麦互通：主播能读写 QQ 群、请 QQ 麦麦说话；QQ 麦麦
 知道自己在直播那边正在播什么、刚播完什么，直播内容也能进它的长期记忆。MaiBot 7×24 运行，Amaidesu 用时才启动，所以由
@@ -76,7 +76,7 @@ MaiBot 只在麦麦自己在某个会话里发出消息后才检查要不要写�
 ```toml
 # config/adapter_policy.toml：放行本插件的直播间网关（群号 = 直播间房间号）
 [[adapters]]
-plugin_id = "amaidesu.amaidesu-bridge-plugin"
+plugin_id = "amaidesu.amaidesu-adapter"
 platform = "bilibili"
 
 [adapters.group]

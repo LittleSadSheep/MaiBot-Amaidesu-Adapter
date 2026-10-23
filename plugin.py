@@ -1,4 +1,4 @@
-"""Amaidesu 桥接插件：直播那边的麦麦与 QQ 这边的麦麦互通。
+"""Amaidesu 适配器：直播那边的麦麦与 QQ 这边的麦麦互通。
 
 两个方向：
 - 主播 → QQ：插件在 MaiBot 插件进程里开一个 MCP 服务，Amaidesu 连入后，主播的工具
@@ -44,7 +44,7 @@ class PluginSectionConfig(PluginConfigBase):
 
     __ui_label__ = "插件"
 
-    enabled: bool = Field(default=True, description="是否启用 Amaidesu 桥接插件")
+    enabled: bool = Field(default=True, description="是否启用 Amaidesu 适配器")
     config_version: str = Field(default="1.0.0", description="配置版本")
 
 
@@ -170,7 +170,7 @@ class LiveMemoryConfig(PluginConfigBase):
     )
 
 
-class AmaidesuBridgeConfig(PluginConfigBase):
+class AmaidesuAdapterConfig(PluginConfigBase):
     """插件完整配置。"""
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
@@ -181,7 +181,7 @@ class AmaidesuBridgeConfig(PluginConfigBase):
     live_memory: LiveMemoryConfig = Field(default_factory=LiveMemoryConfig)
 
 
-def build_live_memory_settings(config: AmaidesuBridgeConfig) -> LiveMemorySettings:
+def build_live_memory_settings(config: AmaidesuAdapterConfig) -> LiveMemorySettings:
     """把插件配置换算成回放参数。"""
 
     section = config.live_memory
@@ -194,7 +194,7 @@ def build_live_memory_settings(config: AmaidesuBridgeConfig) -> LiveMemorySettin
     )
 
 
-def build_live_status_settings(config: AmaidesuBridgeConfig) -> LiveStatusSettings:
+def build_live_status_settings(config: AmaidesuAdapterConfig) -> LiveStatusSettings:
     """把插件配置换算成近况判断参数。"""
 
     section = config.live_status
@@ -206,7 +206,7 @@ def build_live_status_settings(config: AmaidesuBridgeConfig) -> LiveStatusSettin
     )
 
 
-def build_bridge_settings(config: AmaidesuBridgeConfig) -> BridgeSettings:
+def build_bridge_settings(config: AmaidesuAdapterConfig) -> BridgeSettings:
     """把插件配置换算成桥接运行参数（群号去空白、去重，保留先后顺序）。"""
 
     group_ids = tuple(dict.fromkeys(item.strip() for item in config.qq.group_ids if item.strip()))
@@ -226,10 +226,10 @@ def build_bridge_settings(config: AmaidesuBridgeConfig) -> BridgeSettings:
     )
 
 
-class AmaidesuBridgePlugin(MaiBotPlugin):
+class AmaidesuAdapterPlugin(MaiBotPlugin):
     """装配桥接逻辑、直播近况与 MCP 服务，并在卸载时把接管的发言权全部还原。"""
 
-    config_model = AmaidesuBridgeConfig
+    config_model = AmaidesuAdapterConfig
 
     def __init__(self) -> None:
         super().__init__()
@@ -261,7 +261,7 @@ class AmaidesuBridgePlugin(MaiBotPlugin):
         )
         if self.config.live_memory.enabled:
             self._live_memory.start()
-        self._takeover_task = asyncio.create_task(self._takeover_loop(), name="amaidesu_bridge.takeover")
+        self._takeover_task = asyncio.create_task(self._takeover_loop(), name="amaidesu_adapter.takeover")
         await self._start_server()
 
     async def on_unload(self) -> None:
@@ -308,7 +308,7 @@ class AmaidesuBridgePlugin(MaiBotPlugin):
         host, port, token = self._current_server_key()
         self._server_key = (host, port, token)
         if not token:
-            self.ctx.logger.warning("Amaidesu 桥接未配置访问令牌（server.auth_token），MCP 服务不启动")
+            self.ctx.logger.warning("Amaidesu 适配器未配置访问令牌（server.auth_token），MCP 服务不启动")
             return
         bridge = self._bridge
         server = BridgeMcpServer(
@@ -323,7 +323,7 @@ class AmaidesuBridgePlugin(MaiBotPlugin):
         try:
             await server.start()
         except Exception as exc:
-            self.ctx.logger.error(f"Amaidesu 桥接 MCP 服务启动失败（{host}:{port}）: {exc}", exc_info=True)
+            self.ctx.logger.error(f"Amaidesu 适配器 MCP 服务启动失败（{host}:{port}）: {exc}", exc_info=True)
             return
         self._server = server
 
@@ -486,7 +486,7 @@ def _to_mcp_tools(bridge: QQBridge) -> List[types.Tool]:
     ]
 
 
-def create_plugin() -> AmaidesuBridgePlugin:
+def create_plugin() -> AmaidesuAdapterPlugin:
     """创建插件实例。"""
 
-    return AmaidesuBridgePlugin()
+    return AmaidesuAdapterPlugin()

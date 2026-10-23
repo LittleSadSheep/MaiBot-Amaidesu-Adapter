@@ -97,7 +97,7 @@ class LiveStatusStore:
     ) -> None:
         self._path = path
         self._settings = settings
-        self._logger = logger or logging.getLogger("plugin.amaidesu_bridge")
+        self._logger = logger or logging.getLogger("plugin.amaidesu_adapter")
         self._clock_ms = clock_ms
         self._snapshot: Optional[SnapshotReport] = None
         self._snapshot_received_ms = 0

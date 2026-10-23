@@ -1,4 +1,4 @@
-"""联调用：不连 MaiBot，用假宿主按本机 config.toml 起桥接 MCP 服务。
+"""联调用：不连 MaiBot，用假宿主按本机 config.toml 起适配器 MCP 服务。
 
 供 Amaidesu 侧在没有 MaiBot 运行时验证连接、鉴权与工具调用。群名单固定为假宿主里的
 测试群，其余（端口、令牌、接管参数）沿用插件目录下的 config.toml。按 Ctrl+C 退出。
@@ -27,7 +27,7 @@ async def main() -> None:
     plugin._set_context(host.make_context())
     plugin.set_plugin_config(config)
     await plugin.on_load()
-    print(f"假宿主桥接服务已启动，测试群 {GROUP_ID}", flush=True)
+    print(f"假宿主适配器服务已启动，测试群 {GROUP_ID}", flush=True)
     try:
         while True:
             await asyncio.sleep(1)
