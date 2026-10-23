@@ -1,8 +1,9 @@
 # AmaidesuBridgePlugin
 
-让 Amaidesu 的直播主播能读写 QQ 群、请常驻 QQ 的麦麦说话。MaiBot 7×24 运行，
-Amaidesu 用时才启动，所以由本插件在 MaiBot 插件进程里开一个 MCP 服务
-（Streamable HTTP），Amaidesu 作为 MCP 客户端按需连入。
+让 Amaidesu 的直播主播和常驻 QQ 的麦麦互通：主播能读写 QQ 群、请 QQ 麦麦说话；QQ 麦麦
+知道自己在直播那边正在播什么、刚播完什么。MaiBot 7×24 运行，Amaidesu 用时才启动，所以由
+本插件在 MaiBot 插件进程里开一个服务（MCP 用 Streamable HTTP，另有一个 JSON 接口），
+Amaidesu 按需连入。
 
 ## 工具
 
@@ -26,6 +27,23 @@ Amaidesu 用时才启动，所以由本插件在 MaiBot 插件进程里开一个
 以下情况会还原原倍率：到期（后台每 5 秒检查一次）、主播调用 `ask_mai`（先把发言权交还，
 否则倍率为 0 时可能叫不动 QQ 麦麦）、插件卸载。倍率只存在 MaiBot 内存里，MaiBot 重启后
 也会自然回到默认值。MaiBot 的专注模式会无视倍率。
+
+## 直播近况
+
+Amaidesu 开启 `[maibot_sync]` 后，把开播、换环节、收播与场次回顾 POST 到同一端口的
+`/live-status`（同一令牌）。每次都是完整快照，直播期间每 60 秒重发一次当心跳。插件缓存在
+插件数据目录的 `live_status.json`，MaiBot 重启不丢。
+
+- **规划前注入**（`live_status.inject_planner`）：在请求末尾每轮指令之前插一段
+  `<live-status>`。只在三种情况注入：正在直播、下播不到 `live_status.recent_window_ms`
+  （默认 12 小时）、直播中超过 `live_status.stale_after_ms` 没收到心跳（此时只说"可能已经
+  下播"，不再声称正在直播）。只写绝对时刻，不写"已播 N 分钟"，以免打破提示词前缀缓存。
+- **回复前注入**（`live_status.inject_replyer`）：经 `extra_prompt` 附上同一段近况，回复里的
+  环节名、开播时刻才不会编错。
+- **查询工具** `query_live_status(n_back)`：0 = 当前状态和最近一场回顾；1、2… = 往前第几场的回顾。
+  数据来自缓存，Amaidesu 没开也能答。
+
+规划前的钩子每次都会收到整份上下文（这是 MaiBot 钩子的设计）；没有近况时立即原样放行。
 
 ## 配置
 
@@ -52,6 +70,15 @@ headers = { Authorization = "Bearer <同一个令牌>" }
 
 通用 MCP 工具在 Amaidesu 里默认只对主播可见。Amaidesu 启动时连不上本服务会先占位登记，
 后台按 5 秒起步、60 秒封顶的间隔重试，MaiBot 上线后自动补上这组工具，不用重启。
+
+同步直播近况还要在 Amaidesu 的 `config/infra.toml` 打开：
+
+```toml
+[maibot_sync]
+enabled = true
+url = "http://127.0.0.1:8767/live-status"
+token = "<同一个令牌>"
+```
 
 ## 开发
 
