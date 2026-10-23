@@ -162,10 +162,14 @@ class LiveStatusStore:
         status = self._status_sentence(with_recap=True)
         if not status:
             return ""
+        # 实机发现：写成"可以聊，不用硬提"时，模型把它当可有可无的参考，被问"在干嘛"
+        # 仍按人设答"在上网"。这里明确它是关于自己的事实、被问到就照此回答；
+        # 只在无关话题里不主动提，避免逢人就说自己在直播。
         return (
             "<live-status>\n"
-            f"{status}\n"
-            "这是你在直播那边的近况。有人问起或话题相关时可以聊，不用主动硬提。\n"
+            f"关于你自己的事实：{status}\n"
+            "别人问你在干嘛、忙不忙、在不在直播、最近播了什么时，照这个如实回答，不要另编；"
+            "聊别的话题时不用主动提。\n"
             "</live-status>"
         )
 

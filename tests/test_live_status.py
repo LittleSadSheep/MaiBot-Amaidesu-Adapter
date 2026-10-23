@@ -80,6 +80,8 @@ def test_live_injection_uses_absolute_times_and_segment() -> None:
     text = store.injection_text()
     assert text.startswith("<live-status>") and text.endswith("</live-status>")
     assert "你此刻正在B站直播《周五 MC 建房》（今天 20:05 开播），进行到第 3/7 个环节「搭屋顶」。" in text
+    # 写明是关于自己的事实、被问到要照此回答（实机里写成"可以聊"时模型会忽略它）
+    assert "关于你自己的事实" in text and "照这个如实回答" in text
     assert "分钟" not in text  # 不写会每分钟变化的相对时长
 
     store.apply(snapshot(segment={"title": "", "index": 7, "total": 7, "finished": True}))
