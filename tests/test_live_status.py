@@ -79,7 +79,10 @@ def test_live_injection_uses_absolute_times_and_segment() -> None:
     store.apply(snapshot(segment={"title": "搭屋顶", "index": 2, "total": 7}))
     text = store.injection_text()
     assert text.startswith("<live-status>") and text.endswith("</live-status>")
-    assert "你此刻正在B站直播《周五 MC 建房》（今天 20:05 开播），进行到第 3/7 个环节「搭屋顶」。" in text
+    assert (
+        "你此刻正在B站开直播（你自己是主播）《周五 MC 建房》（今天 20:05 开播），进行到第 3/7 个环节「搭屋顶」。"
+        in text
+    )
     # 写明是关于自己的事实、被问到要照此回答（实机里写成"可以聊"时模型会忽略它）
     assert "关于你自己的事实" in text and "照这个如实回答" in text
     assert "分钟" not in text  # 不写会每分钟变化的相对时长
@@ -93,7 +96,7 @@ def test_live_without_heartbeat_becomes_uncertain() -> None:
     store.apply(snapshot())
     clock.now_ms += 4 * MINUTE_MS
     text = store.injection_text()
-    assert text.count("你今天 20:05 开始了一场B站直播《周五 MC 建房》") == 1
+    assert text.count("你今天 20:05 在B站开了一场直播（你自己是主播）《周五 MC 建房》") == 1
     assert "此刻正在" not in text and "最后一次收到直播那边的消息是 今天 21:00" in text and "可能已经下播或断开" in text
 
 
@@ -102,7 +105,10 @@ def test_recent_end_window_is_configurable() -> None:
     store.apply(snapshot(live=False, ended_at_ms=NOW_MS - 5 * MINUTE_MS))
     store.apply(recap())
     text = store.injection_text()
-    assert "你今天 20:05–20:55 在B站直播了一场《周五 MC 建房》，已经下播。这场的回顾：这场搭好了屋……" in text
+    assert (
+        "你今天 20:05–20:55 在B站开了一场直播（你自己是主播）《周五 MC 建房》，已经下播。这场的回顾：这场搭好了屋……"
+        in text
+    )
 
     clock.now_ms += 13 * 60 * MINUTE_MS  # 超出 12 小时窗口：不再主动注入，工具仍能查
     assert store.injection_text() == ""

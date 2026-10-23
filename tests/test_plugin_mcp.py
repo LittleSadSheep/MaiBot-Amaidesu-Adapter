@@ -172,7 +172,7 @@ def test_live_status_endpoint_feeds_hooks_and_query_tool() -> None:
             planner = await plugin.inject_live_status_into_planner(items=items, item_schema_version=1, session_id="s")
             new_items = planner["modified_kwargs"]["items"]
             assert len(new_items) == 3 and new_items[-1] == items[-1]
-            assert "你此刻正在B站直播《周五 MC 建房》" in new_items[1]["parts"][0]["text"]
+            assert "你此刻正在B站开直播（你自己是主播）《周五 MC 建房》" in new_items[1]["parts"][0]["text"]
             assert planner["modified_kwargs"]["session_id"] == "s"  # 其余参数原样带回
 
             # 宿主协议版本不认识时不冒险改请求
@@ -184,7 +184,7 @@ def test_live_status_endpoint_feeds_hooks_and_query_tool() -> None:
             assert extra.startswith("别用表情\n\n<live-status>") and "第 2/3 个环节「搭屋顶」" in extra
 
             answer = await plugin.handle_query_live_status(n_back=0)
-            assert answer["success"] and "你此刻正在B站直播" in answer["content"]
+            assert answer["success"] and "你此刻正在B站开直播" in answer["content"]
             assert (await plugin.handle_query_live_status(n_back="x"))["success"] is False
 
             # 关掉近况：接口拒收、注入与查询停用
@@ -203,7 +203,7 @@ def test_live_status_endpoint_feeds_hooks_and_query_tool() -> None:
         reloaded = make_plugin(host, make_config(free_port()))
         await reloaded.on_load()
         try:
-            assert "你此刻正在B站直播" in (await reloaded.handle_query_live_status())["content"]
+            assert "你此刻正在B站开直播" in (await reloaded.handle_query_live_status())["content"]
         finally:
             await reloaded.on_unload()
 

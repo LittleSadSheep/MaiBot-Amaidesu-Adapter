@@ -187,18 +187,22 @@ class LiveStatusStore:
         return f"往前第 {n_back} 场：" + self._describe_recap(self._recaps[n_back])
 
     def _status_sentence(self, *, with_recap: bool, ignore_window: bool = False) -> str:
+        # 句式都写"开直播（你自己是主播）"：实机里"正在 B站直播"被回复模型读成"在看别人的
+        # 直播"，答出"那个人已经下播了"。点明主播是自己，才不会理解成观看。
         now_ms = self._clock_ms()
         snapshot = self._snapshot
         if snapshot is not None and snapshot.live:
             platform = _platform_name(snapshot.platform)
             if now_ms - self._snapshot_received_ms > self._settings.stale_after_ms:
                 return (
-                    f"你{_clock(snapshot.started_at_ms, now_ms)} 开始了一场{platform}直播{_title(snapshot.title)}，"
-                    f"但最后一次收到直播那边的消息是 {_clock(self._snapshot_received_ms, now_ms)}，"
-                    "之后再没有消息，可能已经下播或断开了；不确定时别说自己正在直播。"
+                    f"你{_clock(snapshot.started_at_ms, now_ms)} 在{platform}开了一场直播（你自己是主播）"
+                    f"{_title(snapshot.title)}，但最后一次收到直播那边的消息是 "
+                    f"{_clock(self._snapshot_received_ms, now_ms)}，之后再没有消息，可能已经下播或断开了；"
+                    "不确定时别说自己正在直播。"
                 )
             sentence = (
-                f"你此刻正在{platform}直播{_title(snapshot.title)}（{_clock(snapshot.started_at_ms, now_ms)} 开播）"
+                f"你此刻正在{platform}开直播（你自己是主播）{_title(snapshot.title)}"
+                f"（{_clock(snapshot.started_at_ms, now_ms)} 开播）"
             )
             segment = snapshot.segment
             if segment is not None and segment.finished:
@@ -213,7 +217,7 @@ class LiveStatusStore:
         session_id, title, started_ms, ended_ms, platform = ended
         span = f"{_clock(started_ms, now_ms)}–{_clock(ended_ms, now_ms, short_same_day_as=started_ms)}"
         where = f" 在{platform}" if platform else " "
-        sentence = f"你{span}{where}直播了一场{_title(title)}，已经下播。"
+        sentence = f"你{span}{where}开了一场直播（你自己是主播）{_title(title)}，已经下播。"
         recap = next((item for item in self._recaps if item.live_session_id == session_id), None)
         if with_recap and recap is not None:
             sentence += "这场的回顾：" + _clip(recap.text, self._settings.recap_chars)
