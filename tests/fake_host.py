@@ -9,10 +9,11 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, List, Optional, Tuple
 
-from maibot_sdk import PluginContext
+from maibot_sdk import PluginContext, PluginPaths
 
 import importlib.util
 import sys
+import tempfile
 
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
@@ -70,6 +71,7 @@ class FakeHost:
         self.trigger_result: Dict[str, Any] = {"success": True, "stream_id": STREAM_ID, "task_id": "t1", "queued": True}
         # 宿主全局配置里与读群署名提示相关的键（点分键 → 值）。
         self.config: Dict[str, Any] = {"bot.nickname": "麦麦", "bot.alias_names": []}
+        self.data_dir = Path(tempfile.mkdtemp(prefix="amaidesu-bridge-test-"))
 
     def add_message(self, timestamp_s: float, text: str, stream_id: str = STREAM_ID) -> None:
         self.messages.setdefault(stream_id, []).append({"timestamp": str(timestamp_s), "text": text})
@@ -78,7 +80,9 @@ class FakeHost:
         return [args for name, args in self.calls if name == capability]
 
     def make_context(self, plugin_id: str = "amaidesu.amaidesu-bridge-plugin") -> PluginContext:
-        return PluginContext(plugin_id, rpc_call=self.rpc)
+        # 插件数据目录放临时目录：近况缓存等落盘文件不写进仓库
+        paths = PluginPaths(data_dir=self.data_dir, runtime_dir=self.data_dir / "runtime")
+        return PluginContext(plugin_id, rpc_call=self.rpc, paths=paths)
 
     async def rpc(
         self, method: str, plugin_id: str, payload: Optional[Dict[str, Any]], timeout_ms: Optional[int] = None

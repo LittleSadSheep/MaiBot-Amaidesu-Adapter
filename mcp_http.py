@@ -1,7 +1,8 @@
 """插件进程内的 MCP 服务（Streamable HTTP，无状态 JSON 响应）。
 
 MaiBot 常驻、Amaidesu 用时才启动，所以由本插件开端口，Amaidesu 作为 MCP 客户端
-按需连入。本模块只负责"开端口、验令牌、转发工具调用"，不认识任何具体工具。
+按需连入。本模块只负责"开端口、验令牌、转发工具调用与 JSON 接口请求"，不认识
+任何具体工具或接口内容。
 """
 
 from contextlib import asynccontextmanager, contextmanager
@@ -14,11 +15,13 @@ from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
-from starlette.responses import Response
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
 import asyncio
+import json
 import logging
 import secrets
 import socket
@@ -31,6 +34,8 @@ _STOP_TIMEOUT_S = 3.0
 
 ListToolsFn = Callable[[], List[types.Tool]]
 CallToolFn = Callable[[str, Dict[str, Any]], Awaitable[Tuple[str, bool]]]
+# 普通 JSON 接口：收到已解析的请求体，返回（HTTP 状态码, 响应 JSON）
+JsonPostFn = Callable[[Any], Awaitable[Tuple[int, Dict[str, Any]]]]
 
 
 class _EmbeddedUvicornServer(uvicorn.Server):
@@ -51,7 +56,11 @@ def _is_loopback(host: str) -> bool:
 
 
 class BridgeMcpServer:
-    """一个带 Bearer 令牌校验的本机/局域网 MCP 服务。"""
+    """一个带 Bearer 令牌校验的本机/局域网 MCP 服务，可附带同令牌的普通 JSON 接口。
+
+    ``json_posts`` 为 {路径: 处理函数}：Amaidesu 推送直播近况这类代码通道走这里，
+    不做成 MCP 工具，免得混进主播 LLM 能看到的工具列表。
+    """
 
     def __init__(
         self,
@@ -61,6 +70,7 @@ class BridgeMcpServer:
         token: str,
         list_tools: ListToolsFn,
         call_tool: CallToolFn,
+        json_posts: Optional[Dict[str, JsonPostFn]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         if not token:
@@ -70,6 +80,7 @@ class BridgeMcpServer:
         self._token = token
         self._list_tools = list_tools
         self._call_tool = call_tool
+        self._json_posts = dict(json_posts or {})
         self._logger = logger or logging.getLogger("plugin.amaidesu_bridge")
         self._server: Optional[_EmbeddedUvicornServer] = None
         self._task: Optional[asyncio.Task[None]] = None
@@ -132,15 +143,43 @@ class BridgeMcpServer:
                     return
                 await endpoint(scope, receive, send)
 
+        logger = self._logger
+
+        class AuthorizedJsonEndpoint:
+            """同令牌的普通 JSON 接口：验令牌 → 解析请求体 → 交给处理函数。"""
+
+            def __init__(self, handler: JsonPostFn) -> None:
+                self._handler = handler
+
+            async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+                headers = dict(scope["headers"])
+                if not secrets.compare_digest(headers.get(b"authorization", b""), expected):
+                    await Response(status_code=401)(scope, receive, send)
+                    return
+                try:
+                    body = await Request(scope, receive).json()
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    await JSONResponse({"ok": False, "error": f"请求体不是合法 JSON: {exc}"}, status_code=400)(
+                        scope, receive, send
+                    )
+                    return
+                try:
+                    status, payload = await self._handler(body)
+                except Exception as exc:
+                    logger.error(f"处理 {scope['path']} 请求出错: {exc}", exc_info=True)
+                    status, payload = 500, {"ok": False, "error": str(exc)}
+                await JSONResponse(payload, status_code=status)(scope, receive, send)
+
         @asynccontextmanager
         async def lifespan(_app: Starlette) -> AsyncIterator[None]:
             async with manager.run():
                 yield
 
-        return Starlette(
-            routes=[Route(MCP_PATH, AuthorizedEndpoint(), methods=["GET", "POST", "DELETE"])],
-            lifespan=lifespan,
+        routes = [Route(MCP_PATH, AuthorizedEndpoint(), methods=["GET", "POST", "DELETE"])]
+        routes.extend(
+            Route(path, AuthorizedJsonEndpoint(handler), methods=["POST"]) for path, handler in self._json_posts.items()
         )
+        return Starlette(routes=routes, lifespan=lifespan)
 
     async def start(self) -> None:
         """绑定端口并等服务就绪；端口被占用等错误直接抛出。"""

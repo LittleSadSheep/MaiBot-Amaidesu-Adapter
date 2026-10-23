@@ -1,19 +1,33 @@
-"""Amaidesu 桥接插件：让直播那边的麦麦能读写 QQ 群、请 QQ 麦麦说话。
+"""Amaidesu 桥接插件：直播那边的麦麦与 QQ 这边的麦麦互通。
 
-插件在 MaiBot 插件进程里开一个 MCP 服务，Amaidesu 作为 MCP 客户端连入后，
-主播的工具列表里就多出读群、发群、请 QQ 麦麦说话三个工具。工具的业务逻辑在
-``bridge.py``，MCP 服务外壳在 ``mcp_http.py``，本文件只负责配置与生命周期。
+两个方向：
+- 主播 → QQ：插件在 MaiBot 插件进程里开一个 MCP 服务，Amaidesu 连入后，主播的工具
+  列表里多出读群、发群、请 QQ 麦麦说话三个工具（业务逻辑在 ``bridge.py``）。
+- 直播 → QQ 麦麦：Amaidesu 把开播、换环节、收播与场次回顾推到同一端口的
+  ``/live-status``，插件缓存后在每次规划与回复前注入近况，并提供查询工具
+  （近况逻辑在 ``live_status.py``）。
+
+MCP 与 JSON 接口的服务外壳在 ``mcp_http.py``，本文件只负责配置、组件声明与生命周期。
 """
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from maibot_sdk import Field, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
+from maibot_sdk.types import ToolParameterInfo, ToolParamType
 from mcp import types
+from pydantic import ValidationError
 
 import asyncio
 
 from .bridge import BridgeSettings, QQBridge
+from .live_status import LiveStatusSettings, LiveStatusStore, insert_status_item, parse_report
 from .mcp_http import BridgeMcpServer
+
+
+# Amaidesu 推送直播近况的接口路径（与 MCP 服务同一端口、同一令牌）
+LIVE_STATUS_PATH = "/live-status"
+# 注入条目使用的 MaiBot Context Item 协议版本；宿主协议升级后跳过注入，免得请求被判无效
+_CONTEXT_ITEM_SCHEMA_VERSION = 1
 
 
 # 后台检查接管是否到期的间隔：到期后最多晚这么久把发言权还给 QQ 麦麦。
@@ -87,6 +101,30 @@ class TakeoverConfig(PluginConfigBase):
     )
 
 
+class LiveStatusConfig(PluginConfigBase):
+    """直播近况：接收 Amaidesu 推来的近况，注入给麦麦并提供查询工具。"""
+
+    __ui_label__ = "直播近况"
+
+    enabled: bool = Field(
+        default=True, description="是否接收 Amaidesu 推来的直播近况（关闭后接口拒收，注入与查询停用）"
+    )
+    inject_planner: bool = Field(default=True, description="是否在每次规划前把近况插进请求末尾")
+    inject_replyer: bool = Field(default=True, description="是否在每次生成回复前把近况附进回复要求")
+    recent_window_ms: int = Field(
+        default=43_200_000,
+        ge=0,
+        description="下播后多久内仍把这场直播当作近况注入（毫秒，默认 12 小时）；0 = 下播即不再注入，只能用工具查",
+    )
+    stale_after_ms: int = Field(
+        default=180_000,
+        ge=30_000,
+        description="直播中超过这么久没收到心跳，就视为状态不明、不再说自己正在直播（毫秒）",
+    )
+    recap_chars: int = Field(default=200, ge=20, le=2000, description="注入的回顾最多保留多少字")
+    keep_recaps: int = Field(default=5, ge=1, le=20, description="缓存最近几场直播的回顾（查询工具最多往前查到这里）")
+
+
 class AmaidesuBridgeConfig(PluginConfigBase):
     """插件完整配置。"""
 
@@ -94,6 +132,19 @@ class AmaidesuBridgeConfig(PluginConfigBase):
     server: ServerConfig = Field(default_factory=ServerConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
     takeover: TakeoverConfig = Field(default_factory=TakeoverConfig)
+    live_status: LiveStatusConfig = Field(default_factory=LiveStatusConfig)
+
+
+def build_live_status_settings(config: AmaidesuBridgeConfig) -> LiveStatusSettings:
+    """把插件配置换算成近况判断参数。"""
+
+    section = config.live_status
+    return LiveStatusSettings(
+        recent_window_ms=section.recent_window_ms,
+        stale_after_ms=section.stale_after_ms,
+        recap_chars=section.recap_chars,
+        keep_recaps=section.keep_recaps,
+    )
 
 
 def build_bridge_settings(config: AmaidesuBridgeConfig) -> BridgeSettings:
@@ -116,21 +167,30 @@ def build_bridge_settings(config: AmaidesuBridgeConfig) -> BridgeSettings:
 
 
 class AmaidesuBridgePlugin(MaiBotPlugin):
-    """装配桥接逻辑与 MCP 服务，并在卸载时把接管的发言权全部还原。"""
+    """装配桥接逻辑、直播近况与 MCP 服务，并在卸载时把接管的发言权全部还原。"""
 
     config_model = AmaidesuBridgeConfig
 
     def __init__(self) -> None:
         super().__init__()
         self._bridge: Optional[QQBridge] = None
+        self._live_status: Optional[LiveStatusStore] = None
         self._server: Optional[BridgeMcpServer] = None
         self._server_key: Optional[Tuple[str, int, str]] = None
         self._takeover_task: Optional[asyncio.Task[None]] = None
+        self._schema_mismatch_logged = False
 
     async def on_load(self) -> None:
-        """加载顺序：建桥接逻辑 → 起接管到期检查 → 开 MCP 服务。"""
+        """加载顺序：建桥接逻辑 → 读回近况缓存 → 起接管到期检查 → 开 MCP 服务。"""
 
         self._bridge = QQBridge(self.ctx, build_bridge_settings(self.config), logger=self.ctx.logger)
+        # 近况写在插件数据目录：MaiBot 重启后仍记得上一场直播
+        self._live_status = LiveStatusStore(
+            self.ctx.paths.data_dir / "live_status.json",
+            build_live_status_settings(self.config),
+            logger=self.ctx.logger,
+        )
+        self._live_status.load()
         self._takeover_task = asyncio.create_task(self._takeover_loop(), name="amaidesu_bridge.takeover")
         await self._start_server()
 
@@ -155,6 +215,8 @@ class AmaidesuBridgePlugin(MaiBotPlugin):
         if scope != "self" or self._bridge is None:
             return
         self._bridge.update_settings(build_bridge_settings(self.config))
+        if self._live_status is not None:
+            self._live_status.update_settings(build_live_status_settings(self.config))
         if self._current_server_key() != self._server_key:
             await self._stop_server()
             await self._start_server()
@@ -177,6 +239,7 @@ class AmaidesuBridgePlugin(MaiBotPlugin):
             token=token,
             list_tools=lambda: _to_mcp_tools(bridge),
             call_tool=bridge.call_tool,
+            json_posts={LIVE_STATUS_PATH: self._receive_live_status},
             logger=self.ctx.logger,
         )
         try:
@@ -190,6 +253,89 @@ class AmaidesuBridgePlugin(MaiBotPlugin):
         if self._server is not None:
             await self._server.stop()
             self._server = None
+
+    # ──── 直播近况 ──────────────────────────────────────────
+
+    async def _receive_live_status(self, body: Any) -> Tuple[int, Dict[str, Any]]:
+        """Amaidesu 推来一份近况：校验后收进缓存（开播、换环节、心跳、收播、回顾都走这里）。"""
+
+        if self._live_status is None or not self.config.live_status.enabled:
+            return 403, {"ok": False, "error": "直播近况同步已关闭（live_status.enabled=false）"}
+        try:
+            report = parse_report(body)
+        except ValidationError as exc:
+            self.ctx.logger.warning(f"Amaidesu 推来的直播近况格式不对，已拒收: {exc}")
+            return 400, {"ok": False, "error": f"近况格式不对: {exc.error_count()} 处错误"}
+        self._live_status.apply(report)
+        self.ctx.logger.debug(f"收到直播近况: type={report.type} 场次={report.live_session_id}")
+        return 200, {"ok": True}
+
+    def _injection_text(self, switch_on: bool) -> str:
+        if not switch_on or self._live_status is None or not self.config.live_status.enabled:
+            return ""
+        return self._live_status.injection_text()
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        description="在规划请求末尾插入直播那边的近况（正在直播 / 近期刚播完 / 状态不明时）",
+    )
+    async def inject_live_status_into_planner(self, **kwargs: Any) -> Dict[str, Any]:
+        """规划前：近况插在末尾每轮指令之前，让麦麦决定说什么时知道自己在不在直播。"""
+
+        text = self._injection_text(self.config.live_status.inject_planner)
+        items = kwargs.get("items")
+        if not text or not isinstance(items, list):
+            return {"action": "continue"}
+        if kwargs.get("item_schema_version") != _CONTEXT_ITEM_SCHEMA_VERSION:
+            if not self._schema_mismatch_logged:
+                self._schema_mismatch_logged = True
+                self.ctx.logger.warning(
+                    f"MaiBot 上下文条目协议版本为 {kwargs.get('item_schema_version')!r}，"
+                    f"本插件只认 {_CONTEXT_ITEM_SCHEMA_VERSION}，已跳过规划前的直播近况注入"
+                )
+            return {"action": "continue"}
+        return {"action": "continue", "modified_kwargs": {**kwargs, "items": insert_status_item(items, text)}}
+
+    @HookHandler(
+        "maisaka.replyer.before_request",
+        description="在回复要求里附上直播那边的近况，让回复里的环节名、开播时刻不编错",
+    )
+    async def inject_live_status_into_replyer(self, **kwargs: Any) -> Dict[str, Any]:
+        """回复前：回复生成只看得到规划器写下的想法，近况细节要单独附上；保留其他插件已有的要求。"""
+
+        text = self._injection_text(self.config.live_status.inject_replyer)
+        if not text:
+            return {"action": "continue"}
+        existing = str(kwargs.get("extra_prompt") or "").strip()
+        combined = f"{existing}\n\n{text}" if existing else text
+        return {"action": "continue", "modified_kwargs": {**kwargs, "extra_prompt": combined}}
+
+    @Tool(
+        "query_live_status",
+        description=(
+            "查看你在直播那边（虚拟主播）的近况：现在是否在直播、进行到哪个环节、最近几场直播做了什么。"
+            "有人问你直播的事、或你想提起直播时先查一下，别凭印象说。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="n_back",
+                param_type=ToolParamType.INTEGER,
+                description="0 或不填 = 当前状态和最近一场的回顾；1、2… = 往前第几场直播的回顾",
+                required=False,
+            )
+        ],
+    )
+    async def handle_query_live_status(self, n_back: Any = 0, **kwargs: Any) -> Dict[str, Any]:
+        """查询直播近况：数据来自缓存，Amaidesu 没开也能回答。"""
+
+        del kwargs
+        if self._live_status is None or not self.config.live_status.enabled:
+            return {"success": False, "error": "直播近况同步已关闭"}
+        try:
+            steps = int(n_back or 0)
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"n_back 需要是整数，收到的是 {n_back!r}"}
+        return {"success": True, "content": self._live_status.query_text(steps)}
 
     async def _takeover_loop(self) -> None:
         """定时还原到期的接管；单次失败只记日志，不中断循环。"""
