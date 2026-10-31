@@ -63,6 +63,12 @@ Amaidesu 开启 `[maibot_sync]` 后，把开播、换环节、收播与场次回
 
 规划前的钩子每次都会收到整份上下文（这是 MaiBot 钩子的设计）；没有近况时立即原样放行。
 
+回复前注入（近况与下一节的共享笔记）经 `extra_prompt` 进入回复请求。MaiBot 用复古回复模板时
+（`debug.replyer_retro_prompt`，回复模型是 mai-replier 时自动打开），这段内容靠模板里的
+`{extra_info_block}` 占位符放进提示词；自定义了模板（如 `data/custom_prompts/zh-CN/retro_replyer.prompt`）
+要保留这个占位符，否则回复模型看不到近况与笔记，只能靠规划器写下的回复理由。MaiBot 会缓存模板，
+直接改文件后要重启 MaiBot 才生效（经 WebUI 改会自动清缓存）。
+
 ## 共享笔记
 
 主播的长期笔记里"身份"那一层——答应过的事、老梗与口头禅、长线目标、关于我自己——两边都用时
