@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "version": "1.0.0",
   "name": "MaiBot-Amaidesu-Adapter",
-  "description": "让 Amaidesu 直播主播经 MCP 读写 QQ 群、请 QQ 麦麦说话；把直播近况与整场记录同步给 QQ 麦麦",
+  "description": "让 Amaidesu 直播主播经 MCP 读写 QQ 群、请 QQ 麦麦说话；把直播近况、各场回顾与两边共用的长期笔记同步给 QQ 麦麦",
   "author": {
     "name": "Amaidesu 开发者",
     "url": "https://github.com/Mai-with-u"

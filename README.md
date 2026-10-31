@@ -1,9 +1,10 @@
 # MaiBot-Amaidesu-Adapter
 
 让 Amaidesu 的直播主播和常驻 QQ 的麦麦互通：主播能读写 QQ 群、请 QQ 麦麦说话；QQ 麦麦
-知道自己在直播那边正在播什么、刚播完什么，直播内容也能进它的长期记忆。MaiBot 7×24 运行，Amaidesu 用时才启动，所以由
-本插件在 MaiBot 插件进程里开一个服务（MCP 用 Streamable HTTP，另有一个 JSON 接口），
-Amaidesu 按需连入。
+知道自己在直播那边正在播什么、刚播完什么、以前每一场做了什么；主播的长期笔记（答应过的事、
+老梗、长线目标、关于我自己）两边共用一份，QQ 里答应的事直播那边也知道。MaiBot 7×24 运行，
+Amaidesu 用时才启动，所以由本插件在 MaiBot 插件进程里开一个服务（MCP 用 Streamable HTTP，
+另有两个 JSON 接口），Amaidesu 按需连入。
 
 ## 工具
 
@@ -15,7 +16,15 @@ Amaidesu 按需连入。
 | `recall_memory` | 回想 QQ 麦麦在这个群里记下的事（长期记忆检索，聊天范围限定为本群） |
 | `recall_person` | QQ 麦麦对某个群友的印象：称呼、本群群名片、认识多久 / 来往几次，以及他在本群的相关记忆 |
 
-只允许操作 `qq.group_ids` 里的群，第一个是默认群。
+只允许操作 `qq.group_ids` 里的群，第一个是默认群。这份名单也是"与直播互通的群"（下称白名单群）：
+直播近况与共享笔记只注入这些群，QQ 麦麦记约定的工具也只在这些群里能用。
+
+插件给 QQ 麦麦（MaiBot 规划器）的工具：
+
+| 工具 | 作用 |
+|---|---|
+| `query_live_status` | 查直播近况与各场回顾：`n_back` 往前第几场，`keyword` 按关键词找场次（新的在前，最多三场） |
+| `record_promise` | 把刚在群里明确答应、以后要在直播里兑现的事记进共享笔记；只在白名单群能用 |
 
 两个回想工具的隐私边界（直播间是公开场合）：记忆检索把聊天范围限定为本群，私聊里形成的记忆
 查不出来；按名字找人先按 MaiBot 的称呼找，但这个人在本群没有群名片时不采用，改在本群最近
@@ -38,8 +47,9 @@ Amaidesu 按需连入。
 ## 直播近况
 
 Amaidesu 开启 `[maibot_sync]` 后，把开播、换环节、收播与场次回顾 POST 到同一端口的
-`/live-status`（同一令牌）。每次都是完整快照，直播期间每 60 秒重发一次当心跳。插件缓存在
-插件数据目录的 `live_status.json`，MaiBot 重启不丢。
+`/live-status`（同一令牌）。每次都是完整快照，直播期间每 60 秒重发一次当心跳。插件把快照缓存在
+插件数据目录的 `live_status.json`，各场回顾存在 `live_recaps.json`（默认每场都留，`live_status.keep_recaps`
+可限场数），MaiBot 重启不丢。下面两种注入都只对白名单群，别的群和私聊不注入。
 
 - **规划前注入**（`live_status.inject_planner`）：在请求末尾每轮指令之前插一段
   `<live-status>`。只在三种情况注入：正在直播、下播不到 `live_status.recent_window_ms`
@@ -47,12 +57,35 @@ Amaidesu 开启 `[maibot_sync]` 后，把开播、换环节、收播与场次回
   下播"，不再声称正在直播）。只写绝对时刻，不写"已播 N 分钟"，以免打破提示词前缀缓存。
 - **回复前注入**（`live_status.inject_replyer`）：经 `extra_prompt` 附上同一段近况，回复里的
   环节名、开播时刻才不会编错。
-- **查询工具** `query_live_status(n_back)`：0 = 当前状态和最近一场回顾；1、2… = 往前第几场的回顾。
-  数据来自缓存，Amaidesu 没开也能答。
+- **查询工具** `query_live_status(n_back, keyword)`：0 = 当前状态和最近一场回顾；1、2… = 往前第几场的回顾；
+  给了关键词就找回顾里提到它的场次。数据来自缓存，Amaidesu 没开也能答。这是 QQ 麦麦了解直播内容
+  的主路线；整场记录回放（下一节）是可选的。
 
 规划前的钩子每次都会收到整份上下文（这是 MaiBot 钩子的设计）；没有近况时立即原样放行。
 
-## 直播进记忆（暂定方案）
+## 共享笔记
+
+主播的长期笔记里"身份"那一层——答应过的事、老梗与口头禅、长线目标、关于我自己——两边都用时
+正本放在这里（插件数据目录的 `notes/MEMORY.md`，每次写入在 `notes/history.jsonl` 留底，留最近 30 条）。
+Amaidesu 开播前经 `/notes`（同一端口、同一令牌）拉取，收播整理后带版本号推回；MaiBot 没开时
+Amaidesu 用本地缓存照常开播，之后自动补推。只用 Amaidesu 时这份不存在。
+
+- **注入**（`notes.inject_planner` / `notes.inject_replyer`）：白名单群的规划请求里，笔记插在系统提示词
+  之后、聊天记录之前（整份不常变，吃得上前缀缓存）；回复请求经 `extra_prompt` 附上。只给上面四节与人
+  自己加的节，去掉标签；"不确定""搁置"两节和答应某位直播观众的条目（标签 `对 昵称#编号`）不给。
+- **记约定**（`notes.record_tool`）：`record_promise` 把一句话追加到"答应过的事"末尾，标
+  `〔未兑现 · 来自 QQ群〕`。限长 `notes.max_promise_chars`（默认 80 字）、同一句不重复记、QQ 记下而
+  未兑现的最多 `notes.max_open_qq_promises` 件（默认 10），正文里的标签括号会被换掉。白名单外的会话
+  里，这个工具会从规划候选里拿掉，被调到也拒绝。之后的整理、淡出、标兑现都由 Amaidesu 收播时做。
+- **接口** `POST /notes`：`{"action": "get"}` 取全文；`{"action": "put", "text", "expected_version", "reason",
+  "changes"}` 整份写，版本对不上回 409（Amaidesu 会重读重做）。版本号 = 全文去掉首尾空白后按 UTF-8
+  取 SHA-1，与 Amaidesu 同一算法。
+- **名字核对**：Amaidesu 每次请求都带上主播人设里的名字，插件与 `bot.nickname`、`bot.alias_names` 比对，
+  结果放进应答（`names.match`）；对不上时两边日志各告警一次，请手动对齐。人设本身不同步。
+
+笔记格式由 Amaidesu 定义，插件只认节名、`对 …#编号`、`来自 …` 与约定状态这几样；格式变了两边要一起改。
+
+## 直播进记忆（可选）
 
 开启 `live_memory.enabled` 后，Amaidesu 每场回顾写好时把整场记录（观众弹幕与付费留言、联动对象
 发言、主播发言）推到同一个 `/live-status`（`type="transcript"`）。插件把它按原始时间回放进一个
@@ -133,6 +166,8 @@ headers = { Authorization = "Bearer <同一个令牌>" }
 enabled = true
 url = "http://127.0.0.1:8767/live-status"
 token = "<同一个令牌>"
+share_notes = true       # 共享长期笔记（默认开），接口地址由 url 推出：/notes
+send_transcript = false  # 整场记录回放（默认关），要开还得打开插件的 live_memory.enabled
 ```
 
 ## 插件类型与热更新
@@ -151,7 +186,8 @@ manifest 里 `plugin_type = "adapter"`：本插件和 SnowLuma 等适配器一�
 - 改插件目录里任何 `.py` 或 `_manifest.json`（包括 `tests/` 里的）都会让 MaiBot 重启**全部**插件运行
   进程，QQ 适配器也会跟着重连。MaiBot 常驻运行时，改代码最好挑没人聊天的时候。
 - Amaidesu 侧的 MCP 连接在插件重启期间调用会失败一次，下一次调用时自动重连；整场记录与近况推送
-  失败会按 5 秒、30 秒、2 分钟重试。
+  失败会按 5 秒、30 秒、2 分钟重试（插件明确拒收时不重试）；共享笔记推不上去时先存在 Amaidesu 本地，
+  按 30 秒、2 分钟、10 分钟补推。
 
 ## 开发
 
