@@ -3,6 +3,10 @@
 Amaidesu 在开播、换环节、收播时推完整快照，直播期间按心跳重发；回顾写好后单独推。
 本模块只认这份契约（``SnapshotReport`` / ``RecapReport``），不关心 Amaidesu 内部结构。
 
+回顾默认每场都留着（``keep_recaps`` = 0），查询工具能按"往前第几场"或关键词翻到任意一场：
+这是 QQ 麦麦了解直播内容的主路线，整场记录回放进直播间会话只在需要进 MaiBot 长期记忆时
+才开。快照与回顾分两个文件存，心跳每分钟改写的只是小的那个。
+
 给麦麦看的文字只写绝对时刻（"20:05 开播"），不写"已播 35 分钟"这类每分钟都变的
 描述：注入段放在每次请求里，内容不变才不会白白打破提示词前缀缓存。
 """
@@ -77,7 +81,8 @@ class LiveStatusSettings:
     recent_window_ms: int = 12 * 60 * 60 * 1000
     stale_after_ms: int = 3 * 60 * 1000
     recap_chars: int = 200
-    keep_recaps: int = 5
+    # 最多留几场回顾；0 = 全部留着
+    keep_recaps: int = 0
 
 
 def _now_ms() -> int:
@@ -85,7 +90,11 @@ def _now_ms() -> int:
 
 
 class LiveStatusStore:
-    """近况缓存：最近一份快照（及收到时刻）+ 最近几场回顾，写在插件数据目录，重启不丢。"""
+    """近况缓存：最近一份快照（及收到时刻）+ 各场回顾，写在插件数据目录，重启不丢。
+
+    ``path`` 存快照；回顾存在同目录的 ``live_recaps.json``（旧版本把回顾也写在 ``path`` 里，
+    读回时照收，下次写入就分开）。
+    """
 
     def __init__(
         self,
@@ -105,7 +114,21 @@ class LiveStatusStore:
 
     def update_settings(self, settings: LiveStatusSettings) -> None:
         self._settings = settings
-        del self._recaps[settings.keep_recaps :]
+        if self._trim_recaps():
+            self._save_recaps()
+
+    def _trim_recaps(self) -> bool:
+        """超过保留场数时删掉最旧的；返回是否删了。"""
+
+        keep = self._settings.keep_recaps
+        if keep <= 0 or len(self._recaps) <= keep:
+            return False
+        del self._recaps[keep:]
+        return True
+
+    @property
+    def _recaps_path(self) -> Optional[Path]:
+        return self._path.with_name("live_recaps.json") if self._path is not None else None
 
     # ──── 写入 ──────────────────────────────────────────────
 
@@ -115,44 +138,65 @@ class LiveStatusStore:
         if isinstance(report, SnapshotReport):
             self._snapshot = report
             self._snapshot_received_ms = self._clock_ms()
-        else:
-            self._recaps = [item for item in self._recaps if item.live_session_id != report.live_session_id]
-            self._recaps.append(report)
-            self._recaps.sort(key=lambda item: item.ended_at_ms, reverse=True)
-            del self._recaps[self._settings.keep_recaps :]
-        self._save()
+            self._save_status()
+            return
+        self._recaps = [item for item in self._recaps if item.live_session_id != report.live_session_id]
+        self._recaps.append(report)
+        self._recaps.sort(key=lambda item: item.ended_at_ms, reverse=True)
+        self._trim_recaps()
+        self._save_recaps()
 
     def load(self) -> None:
         """读回上次落盘的近况；文件损坏只记日志、从空状态开始。"""
 
-        if self._path is None or not self._path.exists():
-            return
-        try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
-            snapshot = data.get("snapshot")
-            self._snapshot = SnapshotReport.model_validate(snapshot) if snapshot else None
-            self._snapshot_received_ms = int(data.get("snapshot_received_ms") or 0)
-            self._recaps = [RecapReport.model_validate(item) for item in data.get("recaps", [])]
-            del self._recaps[self._settings.keep_recaps :]
-        except Exception as exc:
-            self._logger.error(f"读取直播近况缓存失败（{self._path}），从空状态开始: {exc}")
-            self._snapshot, self._snapshot_received_ms, self._recaps = None, 0, []
-
-    def _save(self) -> None:
         if self._path is None:
             return
+        legacy_recaps: List[Any] = []
+        if self._path.exists():
+            try:
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+                snapshot = data.get("snapshot")
+                self._snapshot = SnapshotReport.model_validate(snapshot) if snapshot else None
+                self._snapshot_received_ms = int(data.get("snapshot_received_ms") or 0)
+                legacy_recaps = list(data.get("recaps") or [])
+            except Exception as exc:
+                self._logger.error(f"读取直播近况缓存失败（{self._path}），从空状态开始: {exc}")
+                self._snapshot, self._snapshot_received_ms = None, 0
+        recaps_path = self._recaps_path
+        from_legacy = recaps_path is None or not recaps_path.exists()
+        try:
+            raw = legacy_recaps if from_legacy else json.loads(recaps_path.read_text(encoding="utf-8"))
+            self._recaps = [RecapReport.model_validate(item) for item in raw]
+            self._recaps.sort(key=lambda item: item.ended_at_ms, reverse=True)
+            self._trim_recaps()
+        except Exception as exc:
+            self._logger.error(f"读取直播回顾失败（{recaps_path}），从空列表开始: {exc}")
+            self._recaps = []
+            return
+        if from_legacy and self._recaps:
+            # 旧版本的回顾写在快照文件里：读回时就搬进回顾文件，免得下次写快照把它冲掉
+            self._save_recaps()
+
+    def _save_status(self) -> None:
         payload = {
             "snapshot": self._snapshot.model_dump() if self._snapshot else None,
             "snapshot_received_ms": self._snapshot_received_ms,
-            "recaps": [item.model_dump() for item in self._recaps],
         }
+        self._write_json(self._path, payload, "直播近况缓存")
+
+    def _save_recaps(self) -> None:
+        self._write_json(self._recaps_path, [item.model_dump() for item in self._recaps], "直播回顾")
+
+    def _write_json(self, path: Optional[Path], payload: Any, what: str) -> None:
+        if path is None:
+            return
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            temp = self._path.with_suffix(".tmp")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix(".tmp")
             temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            os.replace(temp, self._path)
+            os.replace(temp, path)
         except Exception as exc:
-            self._logger.error(f"写入直播近况缓存失败（{self._path}）: {exc}")
+            self._logger.error(f"写入{what}失败（{path}）: {exc}")
 
     # ──── 给麦麦看的文字 ────────────────────────────────────
 
@@ -173,9 +217,13 @@ class LiveStatusStore:
             "</live-status>"
         )
 
-    def query_text(self, n_back: int = 0) -> str:
-        """查询工具的回答：0 = 当前状态 + 最近一场回顾；n ≥ 1 = 往前第 n 场的回顾。"""
+    def query_text(self, n_back: int = 0, keyword: str = "") -> str:
+        """查询工具的回答：0 = 当前状态 + 最近一场回顾；n ≥ 1 = 往前第 n 场的回顾；
+        给了关键词时改为找回顾里提到它的场次（新的在前，最多三场）。"""
 
+        keyword = keyword.strip()
+        if keyword:
+            return self._search_text(keyword)
         if n_back <= 0:
             status = self._status_sentence(with_recap=False, ignore_window=True)
             lines = [status or "还没有收到过直播那边的近况。"]
@@ -185,6 +233,17 @@ class LiveStatusStore:
         if n_back >= len(self._recaps):
             return f"只记得最近 {len(self._recaps)} 场直播的回顾，没有往前第 {n_back} 场的。"
         return f"往前第 {n_back} 场：" + self._describe_recap(self._recaps[n_back])
+
+    def _search_text(self, keyword: str, limit: int = 3) -> str:
+        lowered = keyword.lower()
+        hits = [(index, item) for index, item in enumerate(self._recaps) if lowered in item.text.lower()]
+        if not hits:
+            return f"记着的 {len(self._recaps)} 场直播回顾里，没有提到「{keyword}」的。"
+        lines = [f"提到「{keyword}」的直播（共 {len(hits)} 场，新的在前）："]
+        for index, item in hits[:limit]:
+            where = "最近一场" if index == 0 else f"往前第 {index} 场"
+            lines.append(f"{where}：" + self._describe_recap(item))
+        return "\n".join(lines)
 
     def _status_sentence(self, *, with_recap: bool, ignore_window: bool = False) -> str:
         # 句式都写"开直播（你自己是主播）"：实机里"正在 B站直播"被回复模型读成"在看别人的

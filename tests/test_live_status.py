@@ -1,4 +1,4 @@
-"""直播近况：上报校验、缓存与落盘、注入与查询文字、注入位置。"""
+"""直播近况：上报校验、缓存与落盘（快照与回顾分文件、回顾默认全留）、注入与查询文字（含关键词）、注入位置。"""
 
 from datetime import datetime
 from pathlib import Path
@@ -151,10 +151,52 @@ def test_persists_across_restart_and_survives_corrupt_file(tmp_path: Path) -> No
     assert reloaded.injection_text() == store.injection_text()
     assert "最近一场的回顾" in reloaded.query_text(0)
 
+    # 快照文件坏了：近况从空开始，回顾在另一个文件里不受影响
     path.write_text("{坏掉的 JSON", encoding="utf-8")
     broken, _ = make_store(path)
     broken.load()
-    assert broken.injection_text() == ""
+    assert "正在" not in broken.injection_text() and "这场的回顾" in broken.injection_text()
+    (tmp_path / "live_recaps.json").write_text("[坏掉", encoding="utf-8")
+    both_broken, _ = make_store(path)
+    both_broken.load()
+    assert both_broken.injection_text() == ""
+
+
+def test_recaps_kept_by_default_and_searchable_by_keyword(tmp_path: Path) -> None:
+    """回顾默认每场都留：往前第几场与关键词都能翻到很久以前的一场。"""
+    store, _ = make_store(tmp_path / "live_status.json")
+    for session_id in range(1, 31):
+        text = "这场玩了恐怖游戏" if session_id in (3, 20) else f"第 {session_id} 场挖矿"
+        store.apply(recap(session_id=session_id, ended_ms=NOW_MS - (31 - session_id) * 24 * 60 * MINUTE_MS, text=text))
+
+    assert "第 1 场挖矿" in store.query_text(29)
+    found = store.query_text(keyword="恐怖游戏")
+    assert "共 2 场" in found and found.index("往前第 10 场") < found.index("往前第 27 场")
+    assert "没有提到「唱歌」" in store.query_text(keyword="唱歌")
+
+    reloaded, _ = make_store(tmp_path / "live_status.json")
+    reloaded.load()
+    assert "第 1 场挖矿" in reloaded.query_text(29)
+
+
+def test_legacy_recaps_in_status_file_are_read_back(tmp_path: Path) -> None:
+    """旧版本把回顾和快照写在同一个文件里：读回时照收并搬进回顾文件，之后写快照不再带回顾。"""
+    path = tmp_path / "live_status.json"
+    legacy = {
+        "snapshot": None,
+        "snapshot_received_ms": 0,
+        "recaps": [recap(session_id=4, text="旧文件里的回顾").model_dump()],
+    }
+    path.write_text(live_status.json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+    store, _ = make_store(path)
+    store.load()
+    assert "旧文件里的回顾" in store.query_text(0)
+
+    recaps_file = tmp_path / "live_recaps.json"
+    assert "旧文件里的回顾" in recaps_file.read_text(encoding="utf-8")  # 读回时就搬进回顾文件
+    store.apply(snapshot())
+    assert "recaps" not in live_status.json.loads(path.read_text(encoding="utf-8"))
+    assert "旧文件里的回顾" in recaps_file.read_text(encoding="utf-8")
 
 
 def test_status_item_goes_before_the_final_instruction() -> None:

@@ -133,7 +133,11 @@ class LiveStatusConfig(PluginConfigBase):
         description="直播中超过这么久没收到心跳，就视为状态不明、不再说自己正在直播（毫秒）",
     )
     recap_chars: int = Field(default=200, ge=20, le=2000, description="注入的回顾最多保留多少字")
-    keep_recaps: int = Field(default=5, ge=1, le=20, description="缓存最近几场直播的回顾（查询工具最多往前查到这里）")
+    keep_recaps: int = Field(
+        default=0,
+        ge=0,
+        description="最多留几场直播的回顾（查询工具最多往前查到这里）；0 = 每场都留着",
+    )
 
 
 class LiveMemoryConfig(PluginConfigBase):
@@ -415,10 +419,16 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
                 param_type=ToolParamType.INTEGER,
                 description="0 或不填 = 当前状态和最近一场的回顾；1、2… = 往前第几场直播的回顾",
                 required=False,
-            )
+            ),
+            ToolParameterInfo(
+                name="keyword",
+                param_type=ToolParamType.STRING,
+                description="想找哪场直播时填关键词（如游戏名、某件事），返回回顾里提到它的场次；填了就不看 n_back",
+                required=False,
+            ),
         ],
     )
-    async def handle_query_live_status(self, n_back: Any = 0, **kwargs: Any) -> Dict[str, Any]:
+    async def handle_query_live_status(self, n_back: Any = 0, keyword: Any = "", **kwargs: Any) -> Dict[str, Any]:
         """查询直播近况：数据来自缓存，Amaidesu 没开也能回答。"""
 
         del kwargs
@@ -428,7 +438,7 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
             steps = int(n_back or 0)
         except (TypeError, ValueError):
             return {"success": False, "error": f"n_back 需要是整数，收到的是 {n_back!r}"}
-        return {"success": True, "content": self._live_status.query_text(steps)}
+        return {"success": True, "content": self._live_status.query_text(steps, str(keyword or ""))}
 
     # ──── 直播间回放 ────────────────────────────────────────
 
