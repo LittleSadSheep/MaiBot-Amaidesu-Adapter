@@ -346,13 +346,13 @@ def _clock(ts_ms: int, now_ms: int, *, short_same_day_as: Optional[int] = None) 
     return f"{moment.month}月{moment.day}日（周{_WEEKDAY_NAMES[moment.weekday()]}）{clock}"
 
 
-def build_status_item(text: str) -> Dict[str, Any]:
-    """把近况包装成一条 MaiBot Context Item（schema 版本 1 的用户消息条目）。"""
+def build_status_item(text: str, item_id: str = "") -> Dict[str, Any]:
+    """把一段文字包装成一条 MaiBot Context Item（schema 版本 1 的用户消息条目）。"""
 
     return {
         "item_type": "UserMessageItem",
         "meta": {
-            "item_id": f"amaidesu-live-status-{_now_ms()}",
+            "item_id": item_id or f"amaidesu-live-status-{_now_ms()}",
             "logical_turn_id": None,
             "timestamp": datetime.now().isoformat(),
         },
@@ -366,4 +366,17 @@ def insert_status_item(items: List[Any], text: str) -> List[Any]:
     new_items = list(items)
     position = len(new_items) - 1 if new_items else 0
     new_items.insert(max(position, 0), build_status_item(text))
+    return new_items
+
+
+def insert_notes_item(items: List[Any], text: str) -> List[Any]:
+    """共享笔记插在开头的系统提示词之后、聊天记录之前：整份不常变，放在前面才吃得上前缀缓存。"""
+
+    new_items = list(items)
+    position = 0
+    while position < len(new_items) and isinstance(new_items[position], dict):
+        if new_items[position].get("item_type") != "SystemMessageItem":
+            break
+        position += 1
+    new_items.insert(position, build_status_item(text, item_id="amaidesu-shared-notes"))
     return new_items

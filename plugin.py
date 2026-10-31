@@ -6,8 +6,11 @@
 - 直播 → QQ 麦麦：Amaidesu 把开播、换环节、收播与场次回顾推到同一端口的
   ``/live-status``，插件缓存后在每次规划与回复前注入近况，并提供查询工具
   （近况逻辑在 ``live_status.py``）。
-- 直播 → 长期记忆：收播后 Amaidesu 把整场记录推到同一接口，插件按原始时间回放进一个
+- 直播 → 长期记忆（可选）：收播后 Amaidesu 把整场记录推到同一接口，插件按原始时间回放进一个
   固定的直播间会话，由 MaiBot 自己的聊天摘要吸收进长期记忆（回放逻辑在 ``live_memory.py``）。
+- 两边共用的长期笔记：主播笔记里"身份"那一层（答应过的事、老梗、长线目标、关于我自己）的
+  正本存在这里，Amaidesu 经 ``/notes`` 读写；QQ 麦麦在白名单群里看得到、也能记下 QQ 里答应
+  的事（正本逻辑在 ``shared_notes.py``，白名单判断在 ``scope.py``）。近况与笔记只注入白名单群。
 
 MCP 与 JSON 接口的服务外壳在 ``mcp_http.py``，本文件只负责配置、组件声明与生命周期。
 """
@@ -23,12 +26,18 @@ import asyncio
 
 from .bridge import BridgeSettings, QQBridge
 from .live_memory import LiveMemorySettings, LiveRoomReplayer, parse_transcript
-from .live_status import LiveStatusSettings, LiveStatusStore, insert_status_item, parse_report
+from .live_status import LiveStatusSettings, LiveStatusStore, insert_notes_item, insert_status_item, parse_report
 from .mcp_http import BridgeMcpServer
+from .scope import WhitelistScope
+from .shared_notes import NotesSettings, SharedNotesStore, names_check
 
 
 # Amaidesu 推送直播近况的接口路径（与 MCP 服务同一端口、同一令牌）
 LIVE_STATUS_PATH = "/live-status"
+# Amaidesu 读写共享笔记正本的接口路径（同上）
+NOTES_PATH = "/notes"
+# QQ 麦麦记约定的工具名：白名单群外从规划候选里拿掉，调用也拒绝
+RECORD_PROMISE_TOOL = "record_promise"
 # 注入条目使用的 MaiBot Context Item 协议版本；宿主协议升级后跳过注入，免得请求被判无效
 _CONTEXT_ITEM_SCHEMA_VERSION = 1
 # 直播间消息网关的组件名：回放整场记录时经它送入观众消息、接住主播发言
@@ -174,6 +183,27 @@ class LiveMemoryConfig(PluginConfigBase):
     )
 
 
+class NotesConfig(PluginConfigBase):
+    """两边共用的长期笔记：正本存在这里，白名单群里的 QQ 麦麦看得到、记得进去。"""
+
+    __ui_label__ = "共享笔记"
+
+    enabled: bool = Field(
+        default=True,
+        description="是否保存 Amaidesu 主播的长期笔记正本（关闭后接口拒收，Amaidesu 退回只用本地笔记）",
+    )
+    inject_planner: bool = Field(default=True, description="是否在白名单群的每次规划前附上笔记")
+    inject_replyer: bool = Field(default=True, description="是否在白名单群的每次生成回复前附上笔记")
+    record_tool: bool = Field(default=True, description="是否允许白名单群里的麦麦把答应的事记进笔记")
+    max_promise_chars: int = Field(default=80, ge=10, le=500, description="记一件约定的字数上限")
+    max_open_qq_promises: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="QQ 这边记下、还没兑现的约定最多几件；满了先不记新的（直播那边收播整理时会处理旧的）",
+    )
+
+
 class AmaidesuAdapterConfig(PluginConfigBase):
     """插件完整配置。"""
 
@@ -183,6 +213,16 @@ class AmaidesuAdapterConfig(PluginConfigBase):
     takeover: TakeoverConfig = Field(default_factory=TakeoverConfig)
     live_status: LiveStatusConfig = Field(default_factory=LiveStatusConfig)
     live_memory: LiveMemoryConfig = Field(default_factory=LiveMemoryConfig)
+    notes: NotesConfig = Field(default_factory=NotesConfig)
+
+
+def build_notes_settings(config: AmaidesuAdapterConfig) -> NotesSettings:
+    """把插件配置换算成共享笔记参数。"""
+
+    return NotesSettings(
+        max_promise_chars=config.notes.max_promise_chars,
+        max_open_qq_promises=config.notes.max_open_qq_promises,
+    )
 
 
 def build_live_memory_settings(config: AmaidesuAdapterConfig) -> LiveMemorySettings:
@@ -240,15 +280,27 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
         self._bridge: Optional[QQBridge] = None
         self._live_status: Optional[LiveStatusStore] = None
         self._live_memory: Optional[LiveRoomReplayer] = None
+        self._notes: Optional[SharedNotesStore] = None
+        self._scope: Optional[WhitelistScope] = None
+        self._reported_names: Optional[Tuple[str, Tuple[str, ...]]] = None
         self._server: Optional[BridgeMcpServer] = None
         self._server_key: Optional[Tuple[str, int, str]] = None
         self._takeover_task: Optional[asyncio.Task[None]] = None
         self._schema_mismatch_logged = False
 
     async def on_load(self) -> None:
-        """加载顺序：建桥接逻辑 → 读回近况缓存 → 续放没放完的直播记录 → 起接管到期检查 → 开 MCP 服务。"""
+        """加载顺序：建桥接逻辑与白名单 → 读回近况缓存与共享笔记 → 续放没放完的直播记录 → 起接管到期检查 → 开 MCP 服务。"""
 
-        self._bridge = QQBridge(self.ctx, build_bridge_settings(self.config), logger=self.ctx.logger)
+        settings = build_bridge_settings(self.config)
+        self._bridge = QQBridge(self.ctx, settings, logger=self.ctx.logger)
+        self._scope = WhitelistScope(
+            self.ctx, platform=settings.platform, group_ids=settings.group_ids, logger=self.ctx.logger
+        )
+        # 共享笔记正本写在插件数据目录：MaiBot 重启不丢，Amaidesu 不开时 QQ 麦麦照样读得到
+        self._notes = SharedNotesStore(
+            self.ctx.paths.data_dir / "notes", build_notes_settings(self.config), logger=self.ctx.logger
+        )
+        self._notes.load()
         # 近况写在插件数据目录：MaiBot 重启后仍记得上一场直播
         self._live_status = LiveStatusStore(
             self.ctx.paths.data_dir / "live_status.json",
@@ -291,6 +343,11 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
         if scope != "self" or self._bridge is None:
             return
         self._bridge.update_settings(build_bridge_settings(self.config))
+        if self._scope is not None:
+            settings = build_bridge_settings(self.config)
+            self._scope.update(platform=settings.platform, group_ids=settings.group_ids)
+        if self._notes is not None:
+            self._notes.update_settings(build_notes_settings(self.config))
         if self._live_status is not None:
             self._live_status.update_settings(build_live_status_settings(self.config))
         if self._live_memory is not None:
@@ -321,7 +378,7 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
             token=token,
             list_tools=lambda: _to_mcp_tools(bridge),
             call_tool=bridge.call_tool,
-            json_posts={LIVE_STATUS_PATH: self._receive_live_status},
+            json_posts={LIVE_STATUS_PATH: self._receive_live_status, NOTES_PATH: self._receive_notes},
             logger=self.ctx.logger,
         )
         try:
@@ -372,40 +429,155 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
             return ""
         return self._live_status.injection_text()
 
+    def _notes_text(self, switch_on: bool) -> str:
+        if not switch_on or self._notes is None or not self.config.notes.enabled:
+            return ""
+        return self._notes.injection_text()
+
+    async def _in_scope(self, session_id: Any) -> bool:
+        return self._scope is not None and await self._scope.contains(str(session_id or ""))
+
     @HookHandler(
         "maisaka.planner.before_request",
-        description="在规划请求末尾插入直播那边的近况（正在直播 / 近期刚播完 / 状态不明时）",
+        description="白名单群的规划请求里附上共享笔记与直播近况；白名单外拿掉记约定的工具",
     )
-    async def inject_live_status_into_planner(self, **kwargs: Any) -> Dict[str, Any]:
-        """规划前：近况插在末尾每轮指令之前，让麦麦决定说什么时知道自己在不在直播。"""
+    async def inject_context_into_planner(self, **kwargs: Any) -> Dict[str, Any]:
+        """规划前：笔记插在系统提示词之后（整份不常变，吃得上前缀缓存），近况插在末尾每轮指令之前。
 
-        text = self._injection_text(self.config.live_status.inject_planner)
+        只对白名单群（qq.group_ids）注入；其他会话不注入，并把记约定的工具从候选里拿掉。
+        """
+
+        if not await self._in_scope(kwargs.get("session_id")):
+            tools = kwargs.get("tool_definitions")
+            if isinstance(tools, list):
+                kept = [item for item in tools if _tool_name(item) != RECORD_PROMISE_TOOL]
+                if len(kept) != len(tools):
+                    return {"action": "continue", "modified_kwargs": {**kwargs, "tool_definitions": kept}}
+            return {"action": "continue"}
+        notes = self._notes_text(self.config.notes.inject_planner)
+        status = self._injection_text(self.config.live_status.inject_planner)
         items = kwargs.get("items")
-        if not text or not isinstance(items, list):
+        if not (notes or status) or not isinstance(items, list):
             return {"action": "continue"}
         if kwargs.get("item_schema_version") != _CONTEXT_ITEM_SCHEMA_VERSION:
             if not self._schema_mismatch_logged:
                 self._schema_mismatch_logged = True
                 self.ctx.logger.warning(
                     f"MaiBot 上下文条目协议版本为 {kwargs.get('item_schema_version')!r}，"
-                    f"本插件只认 {_CONTEXT_ITEM_SCHEMA_VERSION}，已跳过规划前的直播近况注入"
+                    f"本插件只认 {_CONTEXT_ITEM_SCHEMA_VERSION}，已跳过规划前的笔记与直播近况注入"
                 )
             return {"action": "continue"}
-        return {"action": "continue", "modified_kwargs": {**kwargs, "items": insert_status_item(items, text)}}
+        if notes:
+            items = insert_notes_item(items, notes)
+        if status:
+            items = insert_status_item(items, status)
+        return {"action": "continue", "modified_kwargs": {**kwargs, "items": items}}
 
     @HookHandler(
         "maisaka.replyer.before_request",
-        description="在回复要求里附上直播那边的近况，让回复里的环节名、开播时刻不编错",
+        description="白名单群的回复要求里附上共享笔记与直播近况，让回复里的约定、环节名、开播时刻不编错",
     )
-    async def inject_live_status_into_replyer(self, **kwargs: Any) -> Dict[str, Any]:
-        """回复前：回复生成只看得到规划器写下的想法，近况细节要单独附上；保留其他插件已有的要求。"""
+    async def inject_context_into_replyer(self, **kwargs: Any) -> Dict[str, Any]:
+        """回复前：回复生成只看得到规划器写下的想法，笔记与近况细节要单独附上；保留其他插件已有的要求。"""
 
-        text = self._injection_text(self.config.live_status.inject_replyer)
-        if not text:
+        if not await self._in_scope(kwargs.get("session_id")):
+            return {"action": "continue"}
+        added = [
+            text
+            for text in (
+                self._notes_text(self.config.notes.inject_replyer),
+                self._injection_text(self.config.live_status.inject_replyer),
+            )
+            if text
+        ]
+        if not added:
             return {"action": "continue"}
         existing = str(kwargs.get("extra_prompt") or "").strip()
-        combined = f"{existing}\n\n{text}" if existing else text
+        combined = "\n\n".join([existing, *added] if existing else added)
         return {"action": "continue", "modified_kwargs": {**kwargs, "extra_prompt": combined}}
+
+    # ──── 共享笔记 ──────────────────────────────────────────
+
+    async def _receive_notes(self, body: Any) -> Tuple[int, Dict[str, Any]]:
+        """Amaidesu 读写共享笔记正本：``get`` 取全文，``put`` 带版本号整份写（版本对不上回 409）。
+
+        每次都带上主播名，与 MaiBot 的昵称核对后放进应答，两边名字不一致时双方各告警一次。
+        """
+
+        if self._notes is None or not self.config.notes.enabled:
+            return 403, {"ok": False, "error": "共享笔记已关闭（notes.enabled=false）"}
+        if not isinstance(body, dict) or body.get("action") not in ("get", "put"):
+            return 400, {"ok": False, "error": "action 只能是 get 或 put"}
+        names = await self._check_names(str(body.get("persona_name") or ""))
+        if body["action"] == "put":
+            text, expected = body.get("text"), body.get("expected_version")
+            changes = body.get("changes") or []
+            if not isinstance(text, str) or not isinstance(expected, str) or not isinstance(changes, list):
+                return 400, {"ok": False, "error": "put 需要 text、expected_version（字符串）与 changes（列表）"}
+            written = self._notes.write(
+                text,
+                expected_version=expected,
+                reason=f"Amaidesu：{str(body.get('reason') or '').strip() or '写入'}",
+                changes=[str(item) for item in changes],
+            )
+            if not written:
+                return 409, {
+                    "ok": False,
+                    "error": "共享笔记在读出之后被改过，请重新读取",
+                    "text": self._notes.text,
+                    "version": self._notes.version,
+                    "names": names,
+                }
+        return 200, {"ok": True, "text": self._notes.text, "version": self._notes.version, "names": names}
+
+    async def _check_names(self, persona_name: str) -> Dict[str, Any]:
+        """Amaidesu 的主播名是否是 MaiBot 的昵称或别名之一；对不上时告警（同一组名字只说一次）。"""
+
+        nickname = await self.ctx.config.get("bot.nickname", "")
+        aliases = await self.ctx.config.get("bot.alias_names", [])
+        maibot_names = [str(nickname or ""), *(str(item) for item in (aliases or []) if item)]
+        result = names_check(persona_name, maibot_names)
+        key = (persona_name.strip(), tuple(result["maibot"]))
+        if result["match"] is False and key != self._reported_names:
+            self._reported_names = key
+            self.ctx.logger.warning(
+                f"Amaidesu 的主播叫「{persona_name.strip()}」，MaiBot 叫「{'、'.join(result['maibot']) or '（没配）'}」："
+                "两个身体共用一份笔记，名字要一致——请手动对齐 bot.nickname 与 Amaidesu 人设的 bot_name"
+            )
+        return result
+
+    @Tool(
+        RECORD_PROMISE_TOOL,
+        description=(
+            "把你刚在群里明确答应、以后要在直播里兑现的一件事，记进你和直播那边共用的笔记，"
+            "下次开播时直播那边的你也会知道。只记你自己答应了、而且做得到的事；群友的请求、玩笑、"
+            "客套不算，没答应的别记。只在和直播互通的群里能用。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="content",
+                param_type=ToolParamType.STRING,
+                description="答应了什么，写成一句完整的话，答应谁就写上谁，如「答应群友小明下次直播陪他玩恐怖游戏」",
+                required=True,
+            )
+        ],
+    )
+    async def handle_record_promise(self, content: Any = "", **kwargs: Any) -> Dict[str, Any]:
+        """记一件约定：只在白名单群里能用（按宿主给的群号判断），写进共享笔记的"答应过的事"。"""
+
+        if self._notes is None or self._scope is None or not self.config.notes.enabled:
+            return {"success": False, "error": "共享笔记已关闭"}
+        if not self.config.notes.record_tool:
+            return {"success": False, "error": "记约定的功能没开"}
+        group_id = str(kwargs.get("group_id") or "")
+        if not self._scope.allows_group(group_id, str(kwargs.get("platform") or "")):
+            return {"success": False, "error": "只能在和直播互通的群里记约定"}
+        group_name = self._scope.group_name(group_id)
+        result = self._notes.add_promise(str(content or ""), where=f"「{group_name}」" if group_name else group_id)
+        if result.ok:
+            self.ctx.logger.info(f"QQ 群 {group_id} 里记下一件约定: {str(content)[:60]}")
+            return {"success": True, "content": result.message}
+        return {"success": False, "error": result.message}
 
     @Tool(
         "query_live_status",
@@ -487,6 +659,17 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
                 await self._bridge.expire_takeovers()
             except Exception as exc:
                 self.ctx.logger.error(f"检查水群接管到期时出错: {exc}", exc_info=True)
+
+
+def _tool_name(definition: Any) -> str:
+    """工具定义里的名字（兼容 ``{"name": ...}`` 与 OpenAI function 结构）。"""
+
+    if not isinstance(definition, dict):
+        return ""
+    function = definition.get("function")
+    if isinstance(function, dict) and function.get("name"):
+        return str(function["name"])
+    return str(definition.get("name") or "")
 
 
 def _to_mcp_tools(bridge: QQBridge) -> List[types.Tool]:

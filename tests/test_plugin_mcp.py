@@ -161,9 +161,9 @@ def test_live_status_endpoint_feeds_hooks_and_query_tool() -> None:
         try:
             # 没有近况时两个钩子都原样放行，不改请求
             items = [{"item_type": "SystemMessageItem"}, {"item_type": "UserMessageItem"}]
-            idle = await plugin.inject_live_status_into_planner(items=items, item_schema_version=1, session_id="s")
+            idle = await plugin.inject_context_into_planner(items=items, item_schema_version=1, session_id=STREAM_ID)
             assert idle == {"action": "continue"}
-            assert await plugin.inject_live_status_into_replyer(extra_prompt="", session_id="s") == {
+            assert await plugin.inject_context_into_replyer(extra_prompt="", session_id=STREAM_ID) == {
                 "action": "continue"
             }
 
@@ -175,17 +175,23 @@ def test_live_status_endpoint_feeds_hooks_and_query_tool() -> None:
                 accepted = await client.post(url, json=_live_snapshot(), headers=auth)
                 assert accepted.status_code == 200 and accepted.json() == {"ok": True}
 
-            planner = await plugin.inject_live_status_into_planner(items=items, item_schema_version=1, session_id="s")
+            planner = await plugin.inject_context_into_planner(items=items, item_schema_version=1, session_id=STREAM_ID)
             new_items = planner["modified_kwargs"]["items"]
             assert len(new_items) == 3 and new_items[-1] == items[-1]
             assert "你此刻正在B站开直播（你自己是主播）《周五 MC 建房》" in new_items[1]["parts"][0]["text"]
-            assert planner["modified_kwargs"]["session_id"] == "s"  # 其余参数原样带回
+            assert planner["modified_kwargs"]["session_id"] == STREAM_ID  # 其余参数原样带回
+            # 白名单外的会话（别的群、私聊）不注入直播近况
+            outside = await plugin.inject_context_into_planner(items=items, item_schema_version=1, session_id="私聊")
+            assert outside == {"action": "continue"}
+            assert await plugin.inject_context_into_replyer(extra_prompt="", session_id="私聊") == {
+                "action": "continue"
+            }
 
             # 宿主协议版本不认识时不冒险改请求
-            other = await plugin.inject_live_status_into_planner(items=items, item_schema_version=2, session_id="s")
+            other = await plugin.inject_context_into_planner(items=items, item_schema_version=2, session_id=STREAM_ID)
             assert other == {"action": "continue"}
 
-            replyer = await plugin.inject_live_status_into_replyer(extra_prompt="别用表情", session_id="s")
+            replyer = await plugin.inject_context_into_replyer(extra_prompt="别用表情", session_id=STREAM_ID)
             extra = replyer["modified_kwargs"]["extra_prompt"]
             assert extra.startswith("别用表情\n\n<live-status>") and "第 2/3 个环节「搭屋顶」" in extra
 
@@ -198,7 +204,7 @@ def test_live_status_endpoint_feeds_hooks_and_query_tool() -> None:
             await plugin.on_config_update("self", {}, "1.0.0")
             async with httpx.AsyncClient() as client:
                 assert (await client.post(url, json=_live_snapshot(), headers=auth)).status_code == 403
-            assert await plugin.inject_live_status_into_planner(items=items, item_schema_version=1) == {
+            assert await plugin.inject_context_into_planner(items=items, item_schema_version=1) == {
                 "action": "continue"
             }
             assert (await plugin.handle_query_live_status())["success"] is False
@@ -210,6 +216,87 @@ def test_live_status_endpoint_feeds_hooks_and_query_tool() -> None:
         await reloaded.on_load()
         try:
             assert "你此刻正在B站开直播" in (await reloaded.handle_query_live_status())["content"]
+        finally:
+            await reloaded.on_unload()
+
+    asyncio.run(scenario())
+
+
+NOTES = "## 答应过的事\n- 答应挖钻石〔未兑现 · 始于 #3〕\n- 答应老王玩恐怖游戏〔未兑现 · 对 老王#12〕\n\n## 不确定\n- 好像怕黑"
+
+
+def test_shared_notes_endpoint_hooks_and_record_tool() -> None:
+    """共享笔记：Amaidesu 经 /notes 读写正本（版本冲突回 409、带名字核对）；白名单群注入笔记、能记约定，
+    白名单外不注入、记约定的工具从候选里拿掉且调用被拒；正本落盘，重新加载后还在。"""
+
+    async def scenario() -> None:
+        host = FakeHost()
+        port = free_port()
+        plugin = make_plugin(host, make_config(port))
+        await plugin.on_load()
+        url = f"http://127.0.0.1:{port}/notes"
+        auth = {"Authorization": f"Bearer {TOKEN}"}
+        items = [{"item_type": "SystemMessageItem"}, {"item_type": "UserMessageItem"}]
+        try:
+            async with httpx.AsyncClient(headers=auth) as client:
+                got = (await client.post(url, json={"action": "get", "persona_name": "麦麦"})).json()
+                assert got["text"] == "" and got["names"] == {"maibot": ["麦麦"], "match": True}
+                stale = await client.post(
+                    url, json={"action": "put", "text": NOTES, "expected_version": "旧的", "changes": []}
+                )
+                assert stale.status_code == 409 and stale.json()["text"] == ""
+                put = await client.post(
+                    url,
+                    json={
+                        "action": "put",
+                        "text": NOTES,
+                        "expected_version": got["version"],
+                        "reason": "收播整理（场次 #5）",
+                        "changes": ["新增"],
+                        "persona_name": "小麦",
+                    },
+                )
+                assert put.status_code == 200 and put.json()["text"] == NOTES
+                assert put.json()["names"]["match"] is False  # 两边名字不一致
+                assert (await client.post(url, json={"action": "delete"})).status_code == 400
+
+            planner = await plugin.inject_context_into_planner(items=items, item_schema_version=1, session_id=STREAM_ID)
+            new_items = planner["modified_kwargs"]["items"]
+            notes_text = new_items[1]["parts"][0]["text"]  # 紧跟系统提示词
+            assert len(new_items) == 3 and "- 答应挖钻石（还没兑现）" in notes_text
+            assert "老王" not in notes_text and "好像怕黑" not in notes_text
+            replyer = await plugin.inject_context_into_replyer(extra_prompt="", session_id=STREAM_ID)
+            assert replyer["modified_kwargs"]["extra_prompt"].startswith("<shared-notes>")
+
+            tools = [{"name": "reply"}, {"type": "function", "function": {"name": "record_promise"}}]
+            outside = await plugin.inject_context_into_planner(
+                items=items, item_schema_version=1, session_id="别的群", tool_definitions=tools
+            )
+            assert outside["modified_kwargs"]["tool_definitions"] == [{"name": "reply"}]
+            assert "items" not in outside["modified_kwargs"] or outside["modified_kwargs"]["items"] == items
+
+            recorded = await plugin.handle_record_promise(
+                content="答应群友小明下次直播唱歌", group_id=GROUP_ID, platform="qq", stream_id=STREAM_ID
+            )
+            assert recorded["success"]
+            refused = await plugin.handle_record_promise(content="答应别的群", group_id="99999", platform="qq")
+            assert refused["success"] is False and "互通" in refused["error"]
+            async with httpx.AsyncClient(headers=auth) as client:
+                text = (await client.post(url, json={"action": "get"})).json()["text"]
+            assert text.splitlines()[3] == "- 答应群友小明下次直播唱歌〔未兑现 · 来自 QQ群〕"
+        finally:
+            await plugin.on_unload()
+
+        reloaded = make_plugin(host, make_config(free_port()))
+        await reloaded.on_load()
+        try:
+            planner = await reloaded.inject_context_into_planner(
+                items=items, item_schema_version=1, session_id=STREAM_ID
+            )
+            assert (
+                "答应群友小明下次直播唱歌（还没兑现，来自 QQ群）"
+                in planner["modified_kwargs"]["items"][1]["parts"][0]["text"]
+            )
         finally:
             await reloaded.on_unload()
 
