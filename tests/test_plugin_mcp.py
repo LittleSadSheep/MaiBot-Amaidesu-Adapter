@@ -309,3 +309,54 @@ def test_shared_notes_endpoint_hooks_and_record_tool() -> None:
             await reloaded.on_unload()
 
     asyncio.run(scenario())
+
+
+def test_go_live_announcement_follows_live_status_endpoint() -> None:
+    async def scenario() -> None:
+        host = FakeHost()
+        auth = {"Authorization": f"Bearer {TOKEN}"}
+        config = {"go_live": {"group_ids": [GROUP_ID], "delay_ms": 0}}
+        # 同一场的快照开播时刻固定：三次都推这一份，重启前后才是"同一场"
+        live = _live_snapshot()
+
+        # 默认不配通知群：收到开播也不喊
+        port = free_port()
+        quiet = make_plugin(host, make_config(port))
+        await quiet.on_load()
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(f"http://127.0.0.1:{port}/live-status", json=live, headers=auth)
+            assert response.status_code == 200
+            await quiet._go_live.tick()
+            assert host.calls_of("maisaka.proactive.trigger") == []
+        finally:
+            await quiet.on_unload()
+
+        # 配了通知群：经近况接口收到开播，到点后托 QQ 麦麦喊一次
+        port = free_port()
+        plugin = make_plugin(host, make_config(port) | config)
+        await plugin.on_load()
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(f"http://127.0.0.1:{port}/live-status", json=live, headers=auth)
+            assert response.status_code == 200
+            await plugin._go_live.tick()
+            (call,) = host.calls_of("maisaka.proactive.trigger")
+            assert call["stream_id"] == STREAM_ID and "开播了《周五 MC 建房》" in call["intent"]
+        finally:
+            await plugin.on_unload()
+
+        # 喊过的场次落在插件数据目录：重启后同一场不再喊
+        port = free_port()
+        reloaded = make_plugin(host, make_config(port) | config)
+        await reloaded.on_load()
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(f"http://127.0.0.1:{port}/live-status", json=live, headers=auth)
+            assert response.status_code == 200
+            await reloaded._go_live.tick()
+            assert len(host.calls_of("maisaka.proactive.trigger")) == 1
+        finally:
+            await reloaded.on_unload()
+
+    asyncio.run(scenario())

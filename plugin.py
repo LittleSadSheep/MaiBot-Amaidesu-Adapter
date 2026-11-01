@@ -6,7 +6,8 @@
   群里默认只有 QQ 麦麦一张嘴，主播亲手发群要另外打开 ``qq.direct_send``。
 - 直播 → QQ 麦麦：Amaidesu 把开播、换环节、收播与场次回顾推到同一端口的
   ``/live-status``，插件缓存后在每次规划与回复前注入近况，并提供查询工具
-  （近况逻辑在 ``live_status.py``）。
+  （近况逻辑在 ``live_status.py``）。正式场开播并稳定一段时间后，插件托 QQ 麦麦去
+  通知群喊人看直播（开播提示逻辑在 ``go_live.py``）。
 - 直播 → 长期记忆（可选）：收播后 Amaidesu 把整场记录推到同一接口，插件按原始时间回放进一个
   固定的直播间会话，由 MaiBot 自己的聊天摘要吸收进长期记忆（回放逻辑在 ``live_memory.py``）。
 - 两边共用的长期笔记：主播笔记里"身份"那一层（答应过的事、老梗、长线目标、关于我自己）的
@@ -26,8 +27,16 @@ from pydantic import ValidationError
 import asyncio
 
 from .bridge import BridgeSettings, QQBridge
+from .go_live import GoLiveAnnouncer, GoLiveSettings
 from .live_memory import LiveMemorySettings, LiveRoomReplayer, parse_transcript
-from .live_status import LiveStatusSettings, LiveStatusStore, insert_notes_item, insert_status_item, parse_report
+from .live_status import (
+    LiveStatusSettings,
+    LiveStatusStore,
+    SnapshotReport,
+    insert_notes_item,
+    insert_status_item,
+    parse_report,
+)
 from .mcp_http import BridgeMcpServer
 from .scope import WhitelistScope
 from .shared_notes import NotesSettings, SharedNotesStore, names_check
@@ -45,8 +54,8 @@ _CONTEXT_ITEM_SCHEMA_VERSION = 1
 LIVE_ROOM_GATEWAY = "amaidesu_live_room"
 
 
-# 后台检查接管是否到期的间隔：到期后最多晚这么久把发言权还给 QQ 麦麦。
-_TAKEOVER_CHECK_INTERVAL_S = 5.0
+# 后台定时检查的间隔：接管到期后最多晚这么久把发言权还给 QQ 麦麦，开播提示到点后最多晚这么久喊人。
+_BACKGROUND_CHECK_INTERVAL_S = 5.0
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -166,6 +175,26 @@ class LiveStatusConfig(PluginConfigBase):
     )
 
 
+class GoLiveConfig(PluginConfigBase):
+    """开播提示：正式场开播并稳定一段时间后，托 QQ 麦麦去通知群喊人看直播。"""
+
+    __ui_label__ = "开播提示"
+
+    group_ids: List[str] = Field(
+        default_factory=list,
+        description="开播后去喊人的 QQ 群号；留空 = 不喊。群也要在 adapter_policy.toml 里放行，QQ 麦麦才说得出话",
+    )
+    delay_ms: int = Field(
+        default=300_000,
+        ge=0,
+        description="正式场开播后要持续多久、期间心跳一直正常才喊（毫秒，默认 5 分钟）；误开了马上关掉就不会喊",
+    )
+    room_url: str = Field(
+        default="",
+        description="喊人时附上的直播间链接；留空时按 Amaidesu 推来的平台与房间号拼（B 站：https://live.bilibili.com/<房间号>）",
+    )
+
+
 class LiveMemoryConfig(PluginConfigBase):
     """直播内容进长期记忆：把整场记录回放进直播间会话，由 MaiBot 的聊天摘要吸收。"""
 
@@ -229,6 +258,7 @@ class AmaidesuAdapterConfig(PluginConfigBase):
     qq: QQConfig = Field(default_factory=QQConfig)
     takeover: TakeoverConfig = Field(default_factory=TakeoverConfig)
     live_status: LiveStatusConfig = Field(default_factory=LiveStatusConfig)
+    go_live: GoLiveConfig = Field(default_factory=GoLiveConfig)
     live_memory: LiveMemoryConfig = Field(default_factory=LiveMemoryConfig)
     notes: NotesConfig = Field(default_factory=NotesConfig)
 
@@ -267,6 +297,19 @@ def build_live_status_settings(config: AmaidesuAdapterConfig) -> LiveStatusSetti
     )
 
 
+def build_go_live_settings(config: AmaidesuAdapterConfig) -> GoLiveSettings:
+    """把插件配置换算成开播提示参数（群号去空白、去重；心跳超时沿用近况的判断）。"""
+
+    group_ids = tuple(dict.fromkeys(item.strip() for item in config.go_live.group_ids if item.strip()))
+    return GoLiveSettings(
+        group_ids=group_ids,
+        platform=config.qq.platform.strip(),
+        delay_ms=config.go_live.delay_ms,
+        stale_after_ms=config.live_status.stale_after_ms,
+        room_url=config.go_live.room_url.strip(),
+    )
+
+
 def build_bridge_settings(config: AmaidesuAdapterConfig) -> BridgeSettings:
     """把插件配置换算成桥接运行参数（群号去空白、去重，保留先后顺序）。"""
 
@@ -299,16 +342,18 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
         self._bridge: Optional[QQBridge] = None
         self._live_status: Optional[LiveStatusStore] = None
         self._live_memory: Optional[LiveRoomReplayer] = None
+        self._go_live: Optional[GoLiveAnnouncer] = None
         self._notes: Optional[SharedNotesStore] = None
         self._scope: Optional[WhitelistScope] = None
         self._reported_names: Optional[Tuple[str, Tuple[str, ...]]] = None
         self._server: Optional[BridgeMcpServer] = None
         self._server_key: Optional[Tuple[str, int, str]] = None
-        self._takeover_task: Optional[asyncio.Task[None]] = None
+        self._background_task: Optional[asyncio.Task[None]] = None
         self._schema_mismatch_logged = False
 
     async def on_load(self) -> None:
-        """加载顺序：建桥接逻辑与白名单 → 读回近况缓存与共享笔记 → 续放没放完的直播记录 → 起接管到期检查 → 开 MCP 服务。"""
+        """加载顺序：建桥接逻辑与白名单 → 读回近况缓存、开播提示记录与共享笔记 → 续放没放完的直播记录
+        → 起后台检查（接管到期、开播提示）→ 开 MCP 服务。"""
 
         settings = build_bridge_settings(self.config)
         self._bridge = QQBridge(self.ctx, settings, logger=self.ctx.logger)
@@ -327,6 +372,14 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
             logger=self.ctx.logger,
         )
         self._live_status.load()
+        # 喊过的场次也落在插件数据目录：MaiBot 重启后同一场不会再喊一次
+        self._go_live = GoLiveAnnouncer(
+            self.ctx,
+            build_go_live_settings(self.config),
+            state_path=self.ctx.paths.data_dir / "go_live_announced.json",
+            logger=self.ctx.logger,
+        )
+        self._go_live.load()
         self._live_memory = LiveRoomReplayer(
             self.ctx,
             self.ctx.paths.data_dir,
@@ -336,22 +389,22 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
         )
         if self.config.live_memory.enabled:
             self._live_memory.start()
-        self._takeover_task = asyncio.create_task(self._takeover_loop(), name="amaidesu_adapter.takeover")
+        self._background_task = asyncio.create_task(self._background_loop(), name="amaidesu_adapter.background")
         await self._start_server()
 
     async def on_unload(self) -> None:
-        """卸载顺序：先关服务不再接新调用 → 停回放（进度已落盘）→ 停到期检查 → 还原所有接管。"""
+        """卸载顺序：先关服务不再接新调用 → 停回放（进度已落盘）→ 停后台检查 → 还原所有接管。"""
 
         await self._stop_server()
         if self._live_memory is not None:
             await self._live_memory.stop()
-        if self._takeover_task is not None:
-            self._takeover_task.cancel()
+        if self._background_task is not None:
+            self._background_task.cancel()
             try:
-                await self._takeover_task
+                await self._background_task
             except asyncio.CancelledError:
                 pass
-            self._takeover_task = None
+            self._background_task = None
         if self._bridge is not None:
             await self._bridge.release_all()
 
@@ -369,6 +422,8 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
             self._notes.update_settings(build_notes_settings(self.config))
         if self._live_status is not None:
             self._live_status.update_settings(build_live_status_settings(self.config))
+        if self._go_live is not None:
+            self._go_live.update_settings(build_go_live_settings(self.config))
         if self._live_memory is not None:
             self._live_memory.update_settings(build_live_memory_settings(self.config))
             if self.config.live_memory.enabled:
@@ -430,6 +485,9 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
             self.ctx.logger.warning(f"Amaidesu 推来的直播近况格式不对，已拒收: {exc}")
             return 400, {"ok": False, "error": f"近况格式不对: {exc.error_count()} 处错误"}
         self._live_status.apply(report)
+        if isinstance(report, SnapshotReport) and self._go_live is not None:
+            # 开播、心跳、收播都交给开播提示记账，到不到点由后台检查判断
+            self._go_live.observe(report)
         self.ctx.logger.debug(f"收到直播近况: type={report.type} 场次={report.live_session_id}")
         return 200, {"ok": True}
 
@@ -667,17 +725,21 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
             return {"action": "continue"}
         return {"action": "continue", "modified_kwargs": {**kwargs, "message": claimed}}
 
-    async def _takeover_loop(self) -> None:
-        """定时还原到期的接管；单次失败只记日志，不中断循环。"""
+    async def _background_loop(self) -> None:
+        """定时还原到期的接管、检查开播提示是否到点；两件事各自失败只记日志，不中断循环。"""
 
         while True:
-            await asyncio.sleep(_TAKEOVER_CHECK_INTERVAL_S)
-            if self._bridge is None:
-                continue
-            try:
-                await self._bridge.expire_takeovers()
-            except Exception as exc:
-                self.ctx.logger.error(f"检查水群接管到期时出错: {exc}", exc_info=True)
+            await asyncio.sleep(_BACKGROUND_CHECK_INTERVAL_S)
+            if self._bridge is not None:
+                try:
+                    await self._bridge.expire_takeovers()
+                except Exception as exc:
+                    self.ctx.logger.error(f"检查水群接管到期时出错: {exc}", exc_info=True)
+            if self._go_live is not None:
+                try:
+                    await self._go_live.tick()
+                except Exception as exc:
+                    self.ctx.logger.error(f"检查开播提示时出错: {exc}", exc_info=True)
 
 
 def _tool_name(definition: Any) -> str:
