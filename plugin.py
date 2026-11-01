@@ -10,9 +10,10 @@
   通知群喊人看直播（开播提示逻辑在 ``go_live.py``）。
 - 直播 → 长期记忆（可选）：收播后 Amaidesu 把整场记录推到同一接口，插件按原始时间回放进一个
   固定的直播间会话，由 MaiBot 自己的聊天摘要吸收进长期记忆（回放逻辑在 ``live_memory.py``）。
-- 两边共用的长期笔记：主播笔记里"身份"那一层（答应过的事、老梗、长线目标、关于我自己）的
-  正本存在这里，Amaidesu 经 ``/notes`` 读写；QQ 麦麦在白名单群里看得到、也能记下 QQ 里答应
-  的事（正本逻辑在 ``shared_notes.py``，白名单判断在 ``scope.py``）。近况与笔记只注入白名单群。
+- 两边共用的长期笔记：正本只在 Amaidesu 本地。Amaidesu 经 ``/notes`` 把渲染好的"给 QQ 麦麦看的
+  笔记"发布过来，插件原样存、原样注入；QQ 麦麦在白名单群里答应的事记在插件自己的待收清单里，
+  Amaidesu 读笔记时取走并进它的笔记（逻辑在 ``shared_notes.py``，白名单判断在 ``scope.py``）。
+  近况与笔记只注入白名单群。
 
 MCP 与 JSON 接口的服务外壳在 ``mcp_http.py``，本文件只负责配置、组件声明与生命周期。
 """
@@ -44,7 +45,7 @@ from .shared_notes import NotesSettings, SharedNotesStore, names_check
 
 # Amaidesu 推送直播近况的接口路径（与 MCP 服务同一端口、同一令牌）
 LIVE_STATUS_PATH = "/live-status"
-# Amaidesu 读写共享笔记正本的接口路径（同上）
+# Amaidesu 发布长期笔记、取走 QQ 里记下的约定的接口路径（同上）
 NOTES_PATH = "/notes"
 # QQ 麦麦记约定的工具名：白名单群外从规划候选里拿掉，调用也拒绝
 RECORD_PROMISE_TOOL = "record_promise"
@@ -230,23 +231,23 @@ class LiveMemoryConfig(PluginConfigBase):
 
 
 class NotesConfig(PluginConfigBase):
-    """两边共用的长期笔记：正本存在这里，白名单群里的 QQ 麦麦看得到、记得进去。"""
+    """两边共用的长期笔记：存 Amaidesu 发布来的笔记文字与 QQ 里记下的约定，白名单群里的 QQ 麦麦看得到。"""
 
     __ui_label__ = "共享笔记"
 
     enabled: bool = Field(
         default=True,
-        description="是否保存 Amaidesu 主播的长期笔记正本（关闭后接口拒收，Amaidesu 退回只用本地笔记）",
+        description="是否接收 Amaidesu 发布的长期笔记、让 QQ 麦麦记约定（关闭后接口拒收，Amaidesu 只用本地笔记）",
     )
     inject_planner: bool = Field(default=True, description="是否在白名单群的每次规划前附上笔记")
     inject_replyer: bool = Field(default=True, description="是否在白名单群的每次生成回复前附上笔记")
-    record_tool: bool = Field(default=True, description="是否允许白名单群里的麦麦把答应的事记进笔记")
+    record_tool: bool = Field(default=True, description="是否允许白名单群里的麦麦把答应的事记下来交给直播那边")
     max_promise_chars: int = Field(default=80, ge=10, le=500, description="记一件约定的字数上限")
     max_open_qq_promises: int = Field(
         default=10,
         ge=1,
         le=100,
-        description="QQ 这边记下、还没兑现的约定最多几件；满了先不记新的（直播那边收播整理时会处理旧的）",
+        description="QQ 这边记下、直播那边还没收走的约定最多几件；满了先不记新的（Amaidesu 下次开播时会收走）",
     )
 
 
@@ -264,11 +265,11 @@ class AmaidesuAdapterConfig(PluginConfigBase):
 
 
 def build_notes_settings(config: AmaidesuAdapterConfig) -> NotesSettings:
-    """把插件配置换算成共享笔记参数。"""
+    """把插件配置换算成共享笔记参数（配置键沿用旧名，免得已有的 config.toml 对不上）。"""
 
     return NotesSettings(
         max_promise_chars=config.notes.max_promise_chars,
-        max_open_qq_promises=config.notes.max_open_qq_promises,
+        max_pending_promises=config.notes.max_open_qq_promises,
     )
 
 
@@ -360,7 +361,7 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
         self._scope = WhitelistScope(
             self.ctx, platform=settings.platform, group_ids=settings.group_ids, logger=self.ctx.logger
         )
-        # 共享笔记正本写在插件数据目录：MaiBot 重启不丢，Amaidesu 不开时 QQ 麦麦照样读得到
+        # 发布来的笔记与待收的约定写在插件数据目录：MaiBot 重启不丢，Amaidesu 不开时 QQ 麦麦照样读得到
         self._notes = SharedNotesStore(
             self.ctx.paths.data_dir / "notes", build_notes_settings(self.config), logger=self.ctx.logger
         )
@@ -576,36 +577,34 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
     # ──── 共享笔记 ──────────────────────────────────────────
 
     async def _receive_notes(self, body: Any) -> Tuple[int, Dict[str, Any]]:
-        """Amaidesu 读写共享笔记正本：``get`` 取全文，``put`` 带版本号整份写（版本对不上回 409）。
+        """Amaidesu 与共享笔记打交道的三个动作：
+
+        - ``publish``：收下它渲染好的"给 QQ 麦麦看的笔记"（整份替换，原样存）；
+        - ``promises``：取 QQ 这边记下、还没收走的约定；
+        - ``ack``：它已把这些约定并进笔记并发布，按编号从待收清单里删掉。
 
         每次都带上主播名，与 MaiBot 的昵称核对后放进应答，两边名字不一致时双方各告警一次。
         """
 
         if self._notes is None or not self.config.notes.enabled:
             return 403, {"ok": False, "error": "共享笔记已关闭（notes.enabled=false）"}
-        if not isinstance(body, dict) or body.get("action") not in ("get", "put"):
-            return 400, {"ok": False, "error": "action 只能是 get 或 put"}
+        action = body.get("action") if isinstance(body, dict) else None
+        if action not in ("publish", "promises", "ack"):
+            return 400, {"ok": False, "error": "action 只能是 publish、promises 或 ack（旧版 get / put 已不再支持）"}
         names = await self._check_names(str(body.get("persona_name") or ""))
-        if body["action"] == "put":
-            text, expected = body.get("text"), body.get("expected_version")
-            changes = body.get("changes") or []
-            if not isinstance(text, str) or not isinstance(expected, str) or not isinstance(changes, list):
-                return 400, {"ok": False, "error": "put 需要 text、expected_version（字符串）与 changes（列表）"}
-            written = self._notes.write(
-                text,
-                expected_version=expected,
-                reason=f"Amaidesu：{str(body.get('reason') or '').strip() or '写入'}",
-                changes=[str(item) for item in changes],
-            )
-            if not written:
-                return 409, {
-                    "ok": False,
-                    "error": "共享笔记在读出之后被改过，请重新读取",
-                    "text": self._notes.text,
-                    "version": self._notes.version,
-                    "names": names,
-                }
-        return 200, {"ok": True, "text": self._notes.text, "version": self._notes.version, "names": names}
+        if action == "publish":
+            text = body.get("text")
+            if not isinstance(text, str):
+                return 400, {"ok": False, "error": "publish 需要 text（字符串）"}
+            self._notes.publish(text)
+            return 200, {"ok": True, "names": names}
+        if action == "ack":
+            ids = body.get("ids")
+            if not isinstance(ids, list):
+                return 400, {"ok": False, "error": "ack 需要 ids（列表）"}
+            return 200, {"ok": True, "removed": self._notes.acknowledge([str(item) for item in ids]), "names": names}
+        promises = [{"id": item.id, "text": item.text, "source": item.source} for item in self._notes.pending()]
+        return 200, {"ok": True, "promises": promises, "names": names}
 
     async def _check_names(self, persona_name: str) -> Dict[str, Any]:
         """Amaidesu 的主播名是否是 MaiBot 的昵称或别名之一；对不上时告警（同一组名字只说一次）。"""
@@ -640,7 +639,7 @@ class AmaidesuAdapterPlugin(MaiBotPlugin):
         ],
     )
     async def handle_record_promise(self, content: Any = "", **kwargs: Any) -> Dict[str, Any]:
-        """记一件约定：只在白名单群里能用（按宿主给的群号判断），写进共享笔记的"答应过的事"。"""
+        """记一件约定：只在白名单群里能用（按宿主给的群号判断），放进待收清单，Amaidesu 下次读笔记时收走。"""
 
         if self._notes is None or self._scope is None or not self.config.notes.enabled:
             return {"success": False, "error": "共享笔记已关闭"}

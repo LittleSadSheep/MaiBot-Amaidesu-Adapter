@@ -230,12 +230,13 @@ def test_live_status_endpoint_feeds_hooks_and_query_tool() -> None:
     asyncio.run(scenario())
 
 
-NOTES = "## 答应过的事\n- 答应挖钻石〔未兑现 · 始于 #3〕\n- 答应老王玩恐怖游戏〔未兑现 · 对 老王#12〕\n\n## 不确定\n- 好像怕黑"
+# Amaidesu 渲染好的"给 QQ 麦麦看的笔记"：插件不解析，原样存、原样注入
+PUBLISHED = "## 答应过的事\n- 答应挖钻石（还没兑现）\n\n## 老梗与口头禅\n- 翻车时坚称是节目效果"
 
 
 def test_shared_notes_endpoint_hooks_and_record_tool() -> None:
-    """共享笔记：Amaidesu 经 /notes 读写正本（版本冲突回 409、带名字核对）；白名单群注入笔记、能记约定，
-    白名单外不注入、记约定的工具从候选里拿掉且调用被拒；正本落盘，重新加载后还在。"""
+    """共享笔记：Amaidesu 经 /notes 发布笔记、取走 QQ 记下的约定并回报已收（带名字核对）；白名单群注入笔记、
+    能记约定，白名单外不注入、记约定的工具从候选里拿掉且调用被拒；发布的笔记与待收清单落盘，重新加载后还在。"""
 
     async def scenario() -> None:
         host = FakeHost()
@@ -247,32 +248,22 @@ def test_shared_notes_endpoint_hooks_and_record_tool() -> None:
         items = [{"item_type": "SystemMessageItem"}, {"item_type": "UserMessageItem"}]
         try:
             async with httpx.AsyncClient(headers=auth) as client:
-                got = (await client.post(url, json={"action": "get", "persona_name": "麦麦"})).json()
-                assert got["text"] == "" and got["names"] == {"maibot": ["麦麦"], "match": True}
-                stale = await client.post(
-                    url, json={"action": "put", "text": NOTES, "expected_version": "旧的", "changes": []}
+                published = await client.post(
+                    url, json={"action": "publish", "text": PUBLISHED, "persona_name": "麦麦"}
                 )
-                assert stale.status_code == 409 and stale.json()["text"] == ""
-                put = await client.post(
-                    url,
-                    json={
-                        "action": "put",
-                        "text": NOTES,
-                        "expected_version": got["version"],
-                        "reason": "收播整理（场次 #5）",
-                        "changes": ["新增"],
-                        "persona_name": "小麦",
-                    },
-                )
-                assert put.status_code == 200 and put.json()["text"] == NOTES
-                assert put.json()["names"]["match"] is False  # 两边名字不一致
-                assert (await client.post(url, json={"action": "delete"})).status_code == 400
+                assert published.status_code == 200
+                assert published.json()["names"] == {"maibot": ["麦麦"], "match": True}
+                mismatch = await client.post(url, json={"action": "promises", "persona_name": "小麦"})
+                assert mismatch.json() == {"ok": True, "promises": [], "names": {"maibot": ["麦麦"], "match": False}}
+                # 旧版 Amaidesu 的读写动作明确拒收，提示要升级
+                old = await client.post(url, json={"action": "get"})
+                assert old.status_code == 400 and "get" in old.json()["error"]
+                assert (await client.post(url, json={"action": "publish"})).status_code == 400
 
             planner = await plugin.inject_context_into_planner(items=items, item_schema_version=1, session_id=STREAM_ID)
             new_items = planner["modified_kwargs"]["items"]
             notes_text = new_items[1]["parts"][0]["text"]  # 紧跟系统提示词
-            assert len(new_items) == 3 and "- 答应挖钻石（还没兑现）" in notes_text
-            assert "老王" not in notes_text and "好像怕黑" not in notes_text
+            assert len(new_items) == 3 and PUBLISHED in notes_text
             replyer = await plugin.inject_context_into_replyer(extra_prompt="", session_id=STREAM_ID)
             assert replyer["modified_kwargs"]["extra_prompt"].startswith("<shared-notes>")
 
@@ -290,21 +281,27 @@ def test_shared_notes_endpoint_hooks_and_record_tool() -> None:
             refused = await plugin.handle_record_promise(content="答应别的群", group_id="99999", platform="qq")
             assert refused["success"] is False and "互通" in refused["error"]
             async with httpx.AsyncClient(headers=auth) as client:
-                text = (await client.post(url, json={"action": "get"})).json()["text"]
-            assert text.splitlines()[3] == "- 答应群友小明下次直播唱歌〔未兑现 · 来自 QQ群〕"
+                pending = (await client.post(url, json={"action": "promises"})).json()["promises"]
+            assert [(item["text"], item["source"]) for item in pending] == [("答应群友小明下次直播唱歌", "QQ群")]
         finally:
             await plugin.on_unload()
 
         reloaded = make_plugin(host, make_config(free_port()))
         await reloaded.on_load()
+        reloaded_url = f"http://127.0.0.1:{reloaded.config.server.port}/notes"
         try:
             planner = await reloaded.inject_context_into_planner(
                 items=items, item_schema_version=1, session_id=STREAM_ID
             )
-            assert (
-                "答应群友小明下次直播唱歌（还没兑现，来自 QQ群）"
-                in planner["modified_kwargs"]["items"][1]["parts"][0]["text"]
-            )
+            notes_text = planner["modified_kwargs"]["items"][1]["parts"][0]["text"]
+            assert PUBLISHED in notes_text and "答应群友小明下次直播唱歌（还没兑现，来自 QQ群）" in notes_text
+
+            # Amaidesu 收走约定、发布了含这件事的新笔记后回报已收：待收清单清空
+            async with httpx.AsyncClient(headers=auth) as client:
+                acked = await client.post(reloaded_url, json={"action": "ack", "ids": [pending[0]["id"]]})
+                assert acked.json()["removed"] == 1
+                left = (await client.post(reloaded_url, json={"action": "promises"})).json()["promises"]
+            assert left == []
         finally:
             await reloaded.on_unload()
 

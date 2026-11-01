@@ -1,52 +1,36 @@
-"""共享长期笔记：Amaidesu 主播长期笔记的正本，两个身体（直播与 QQ）共用一份。
+"""共享长期笔记在 MaiBot 这边的两样东西：Amaidesu 发布来的笔记文字，与 QQ 麦麦记下、直播那边还没收走的约定。
 
-Amaidesu 与 MaiBot 都在用时，主播笔记里"身份"那一层——答应过的事、老梗与口头禅、长线目标、
-关于我自己——的正本放在这里：MaiBot 7×24 常驻，QQ 麦麦随时读得到，QQ 里答应的事也能随时
-记进来；Amaidesu 开播前拉取、收播整理后带版本号推回，本地只留缓存。只用 Amaidesu 时这份
-不存在，与本插件无关。
+主播的长期笔记（答应过的事、老梗与口头禅、长线目标、关于我自己）只有一份正本，在 Amaidesu
+本地，格式也归 Amaidesu 管。两边连接只交换"发布出来的东西"，不为了对接去改任何一边的内部：
 
-笔记的格式由 Amaidesu 定义，这里只认最小的一部分（契约）：
+- Amaidesu 每次写完正式场的笔记，把它自己渲染好的"给 QQ 麦麦看的笔记"推过来；这里原样存下、
+  原样注入，不解析、不改写。
+- QQ 麦麦在群里答应的事记在插件自己的约定清单里（正文、在哪个群记的、什么时候），注入时和
+  笔记一起给它看，记下当场就看得到。
+- Amaidesu 读笔记时来取清单，按它自己的规则并进笔记、发布新版本后告诉这里"已收"，这里再从
+  清单里删掉。
 
-- ``## 节名`` 分节，节下每行一条 ``- 正文``，行尾可带一组标签 ``〔标签 · 标签〕``；
-- 给 QQ 麦麦看的是"答应过的事、老梗与口头禅、长线目标、关于我自己"四节与人自己加的节，
-  "不确定"（还没坐实）与"搁置"（已淡出）不给；
-- 带 ``对 昵称#观众编号`` 标签的条目是答应某位直播观众的事，只在直播里那位观众发言时才有用，
-  不给 QQ 这边；
-- QQ 里记下的约定追加到"答应过的事"末尾，标 ``未兑现 · 来自 QQ群``。Amaidesu 收播整理时
-  把它当作别处写进来的条目：会被整理、会淡出、能标兑现，但不当成人手写的行。
-
-条目的整理、淡出与标兑现都在 Amaidesu 那边做；这里只存正本（写入核对版本号并留底）、给 QQ
-麦麦渲染注入文字、追加约定、核对两边名字。版本号 = 去掉首尾空白后按 UTF-8 取 SHA-1（十六进制），
-与 Amaidesu 一致，两边对同一份全文算出的版本号相同。
+只用 Amaidesu 时这里什么都没有，与本插件无关。
 """
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence
 
-import hashlib
 import json
 import logging
 import os
 import re
 import time
+import uuid
 
 
-SECTION_PROMISES = "答应过的事"
-# 给 QQ 麦麦看的固定四节；人自己加的节（不在已知节名里）也给
-INJECTED_SECTIONS = (SECTION_PROMISES, "老梗与口头禅", "长线目标", "关于我自己")
-_HIDDEN_SECTIONS = ("不确定", "搁置")
+# QQ 里记下的约定告诉 Amaidesu 的来处（Amaidesu 并进笔记时标成"来自 QQ群"）
 QQ_SOURCE = "QQ群"
-STATUS_OPEN = "未兑现"
 
-_TAG_BLOCK = re.compile(r"〔([^〔〕]*)〕\s*$")
-_VIEWER_TAG = re.compile(r"^对\s*.*#\d+$")
-
-
-def content_version(text: str) -> str:
-    """全文的版本号：去掉首尾空白后按 UTF-8 取 SHA-1（十六进制），与 Amaidesu 同一算法。"""
-
-    return hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()
+# 旧版本把 Amaidesu 格式的整份笔记当正本存在这里；读到时只把 QQ 记下、还没兑现的约定搬进清单
+_LEGACY_FILE = "MEMORY.md"
+_LEGACY_PROMISE = re.compile(r"^[-*]\s*(.+?)〔([^〔〕]*)〕\s*$")
 
 
 def _now_ms() -> int:
@@ -58,8 +42,7 @@ class NotesSettings:
     """共享笔记的参数（由插件配置换算而来）。"""
 
     max_promise_chars: int = 80
-    max_open_qq_promises: int = 10
-    history_keep: int = 30
+    max_pending_promises: int = 10
 
 
 @dataclass(frozen=True)
@@ -70,11 +53,22 @@ class PromiseResult:
     message: str
 
 
-class SharedNotesStore:
-    """共享笔记的正本：一份全文 + 留底记录，落在插件数据目录，MaiBot 重启不丢。
+@dataclass(frozen=True)
+class PendingPromise:
+    """QQ 里记下、直播那边还没收走的一件约定。"""
 
-    文件：``<目录>/MEMORY.md`` 是正本全文；``<目录>/history.jsonl`` 每行一次写入（时刻、来由、
-    改动说明、写之前的全文），只留最近 ``history_keep`` 条，写坏了能翻回去。
+    id: str
+    text: str
+    source: str
+    where: str
+    created_at_ms: int
+
+
+class SharedNotesStore:
+    """发布来的笔记文字 + 待收的约定清单，落在插件数据目录，MaiBot 重启不丢。
+
+    文件：``<目录>/published.md`` 是 Amaidesu 最近一次发布的文字；``<目录>/promises.json`` 是
+    待收的约定清单。
     """
 
     def __init__(
@@ -89,45 +83,69 @@ class SharedNotesStore:
         self._settings = settings
         self._logger = logger or logging.getLogger("plugin.amaidesu_adapter")
         self._clock_ms = clock_ms
-        self._text = ""
+        self._published = ""
+        self._promises: List[PendingPromise] = []
 
     @property
-    def text(self) -> str:
-        return self._text
+    def published(self) -> str:
+        return self._published
 
-    @property
-    def version(self) -> str:
-        return content_version(self._text)
+    def pending(self) -> List[PendingPromise]:
+        """待收的约定（先记的在前）。"""
+
+        return list(self._promises)
 
     def update_settings(self, settings: NotesSettings) -> None:
         self._settings = settings
 
     def load(self) -> None:
-        """读回正本；文件读不了只记日志、按空笔记开始（下次 Amaidesu 连上会把它那份推上来）。"""
+        """读回发布的文字与约定清单；文件读不了只记日志、按空的开始（下次 Amaidesu 开播会再发布）。"""
 
         if self._dir is None:
             return
-        path = self._dir / "MEMORY.md"
-        if not path.exists():
+        published = self._dir / "published.md"
+        if published.exists():
+            try:
+                self._published = published.read_bytes().decode("utf-8-sig").strip()
+            except Exception as exc:
+                self._logger.error(f"读取 Amaidesu 发布的笔记失败（{published}），按空笔记开始: {exc}")
+                self._published = ""
+        promises = self._dir / "promises.json"
+        if promises.exists():
+            try:
+                raw = json.loads(promises.read_bytes().decode("utf-8"))
+                self._promises = [PendingPromise(**item) for item in raw]
+            except Exception as exc:
+                self._logger.error(f"读取待收的约定清单失败（{promises}），按空清单开始: {exc}")
+                self._promises = []
+        self._migrate_legacy()
+
+    # ──── Amaidesu 那边的读写 ────────────────────────────────
+
+    def publish(self, text: str) -> None:
+        """收下 Amaidesu 发布的笔记文字（整份替换）。"""
+
+        text = (text or "").strip()
+        if text == self._published:
             return
-        try:
-            self._text = path.read_bytes().decode("utf-8-sig").strip()
-        except Exception as exc:
-            self._logger.error(f"读取共享笔记失败（{path}），按空笔记开始: {exc}")
-            self._text = ""
+        self._published = text
+        self._write("published.md", text + "\n" if text else "")
 
-    # ──── 写入 ──────────────────────────────────────────────
+    def acknowledge(self, ids: Sequence[str]) -> int:
+        """Amaidesu 收走了这些约定（已并进它的笔记并发布）：从清单里删掉，返回删了几件。"""
 
-    def write(self, text: str, *, expected_version: str, reason: str, changes: Sequence[str] = ()) -> bool:
-        """整份覆盖写；``expected_version`` 与当前版本对不上时不写、返回 False（由写入方重读重做）。"""
+        wanted = {str(item) for item in ids}
+        kept = [item for item in self._promises if item.id not in wanted]
+        removed = len(self._promises) - len(kept)
+        if removed:
+            self._promises = kept
+            self._save_promises()
+        return removed
 
-        if expected_version != self.version:
-            return False
-        self._replace((text or "").strip(), reason=reason, changes=list(changes))
-        return True
+    # ──── QQ 麦麦记约定 ──────────────────────────────────────
 
     def add_promise(self, content: str, *, where: str) -> PromiseResult:
-        """把 QQ 里答应的一件事追加到"答应过的事"末尾；太长、重复、未兑现的太多时不记。"""
+        """把 QQ 里答应的一件事放进待收清单；太长、清单里已有、待收的太多时不记。"""
 
         text = _clean_promise(content)
         if not text:
@@ -136,151 +154,93 @@ class SharedNotesStore:
             return PromiseResult(
                 False, f"约定写得太长了（{len(text)} 字），精简到 {self._settings.max_promise_chars} 字以内再记"
             )
-        lines = self._text.splitlines()
-        promises = _section_bodies(lines, SECTION_PROMISES)
-        if any(_strip_tags(body)[0] == text for body in promises):
+        if any(item.text == text for item in self._promises):
             return PromiseResult(True, "这件事已经记着了")
-        open_from_qq = sum(1 for body in promises if {STATUS_OPEN, f"来自 {QQ_SOURCE}"} <= set(_strip_tags(body)[1]))
-        if open_from_qq >= self._settings.max_open_qq_promises:
+        if len(self._promises) >= self._settings.max_pending_promises:
             return PromiseResult(
                 False,
-                f"QQ 这边记下、还没兑现的约定已经有 {open_from_qq} 件了，先兑现或等直播那边整理后再记新的",
+                f"QQ 这边记下、直播那边还没收走的约定已经有 {len(self._promises)} 件了，等直播那边开播收走后再记新的",
             )
-        line = f"- {text}〔{STATUS_OPEN} · 来自 {QQ_SOURCE}〕"
-        self._replace(
-            "\n".join(_append_to_section(lines, SECTION_PROMISES, line)).strip(),
-            reason=f"QQ 群{where}里记下的约定",
-            changes=[f"新增〔{SECTION_PROMISES}〕{text}"],
-        )
+        self._append(text, source=QQ_SOURCE, where=where)
         return PromiseResult(True, "记下了，直播那边下次开播也会知道")
 
-    def _replace(self, text: str, *, reason: str, changes: List[str]) -> None:
-        if text == self._text:
-            return
-        previous, self._text = self._text, text
-        if self._dir is None:
-            return
-        try:
-            self._dir.mkdir(parents=True, exist_ok=True)
-            self._append_history(previous, reason, changes)
-            _atomic_write(self._dir / "MEMORY.md", text + "\n" if text else "")
-        except Exception as exc:
-            self._logger.error(f"写入共享笔记失败（{self._dir}）: {exc}")
-
-    def _append_history(self, previous: str, reason: str, changes: List[str]) -> None:
-        assert self._dir is not None
-        path = self._dir / "history.jsonl"
-        lines = path.read_bytes().decode("utf-8").splitlines() if path.exists() else []
-        entry = {"at_ms": self._clock_ms(), "reason": reason, "changes": changes, "previous": previous}
-        lines.append(json.dumps(entry, ensure_ascii=False))
-        kept = [line for line in lines if line.strip()][-self._settings.history_keep :]
-        _atomic_write(path, "".join(line + "\n" for line in kept))
+    def _append(self, text: str, *, source: str, where: str) -> None:
+        # 编号随机生成：只用来让 Amaidesu 回报"收走了哪几件"，重启后也不会和旧编号撞上
+        self._promises.append(
+            PendingPromise(
+                id=uuid.uuid4().hex[:12], text=text, source=source, where=where, created_at_ms=self._clock_ms()
+            )
+        )
+        self._save_promises()
 
     # ──── 给 QQ 麦麦看的文字 ────────────────────────────────
 
     def injection_text(self) -> str:
-        """每轮规划 / 回复前注入的笔记；没有能给 QQ 这边看的条目时返回空串。"""
+        """每轮规划 / 回复前注入的笔记；发布的文字与待收的约定都没有时返回空串。"""
 
-        body = render_for_qq(self._text)
-        if not body:
+        parts: List[str] = []
+        if self._published:
+            parts.append(self._published)
+        if self._promises:
+            lines = "\n".join(f"- {item.text}（还没兑现，来自 {item.source}）" for item in self._promises)
+            parts.append(f"QQ 这边刚答应、直播那边还没收进笔记的约定：\n{lines}")
+        if not parts:
             return ""
+        body = "\n\n".join(parts)
         return (
             "<shared-notes>\n"
-            "你一直记着的事（直播那边和 QQ 这边共用这一份笔记，你自己就是那个主播）：\n"
+            "你一直记着的事（直播那边和 QQ 这边共用这份笔记，你自己就是那个主播）：\n"
             f"{body}\n"
             "有人提起相关的事时照这个说，不用主动念叨；还没兑现的约定别说成已经做了。\n"
             "</shared-notes>"
         )
 
+    # ──── 落盘 ──────────────────────────────────────────────
 
-def render_for_qq(text: str) -> str:
-    """笔记全文 → 给 QQ 麦麦看的正文：只留注入的节，去掉标签，跳过只对某位直播观众的条目。"""
+    def _save_promises(self) -> None:
+        payload = json.dumps([asdict(item) for item in self._promises], ensure_ascii=False)
+        self._write("promises.json", payload)
 
-    preamble: List[str] = []
-    blocks: List[Tuple[str, List[str]]] = []
-    section = ""
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith("## "):
-            section = line[3:].strip()
-            blocks.append((section, []))
-            continue
-        if not section:
-            preamble.append(line)
-            continue
-        if section in _HIDDEN_SECTIONS:
-            continue
-        body = line[2:].strip() if line[:2] in ("- ", "* ") else line
-        item_text, tags = _strip_tags(body)
-        if not item_text or any(_VIEWER_TAG.match(tag) for tag in tags):
-            continue
-        blocks[-1][1].append(f"- {item_text}" + _describe(tags))
-    parts = ["\n".join(preamble)] if preamble else []
-    parts.extend("\n".join([f"## {name}", *lines]) for name, lines in blocks if lines)
-    return "\n\n".join(parts)
+    def _write(self, name: str, content: str) -> None:
+        if self._dir is None:
+            return
+        try:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            _atomic_write(self._dir / name, content)
+        except Exception as exc:
+            self._logger.error(f"写入共享笔记文件失败（{self._dir / name}）: {exc}")
 
+    def _migrate_legacy(self) -> None:
+        """旧版本在这里存过 Amaidesu 格式的整份笔记：QQ 记下、还没兑现的约定搬进清单，旧文件改名留底。
 
-def _describe(tags: List[str]) -> str:
-    notes: List[str] = []
-    for tag in tags:
-        if tag == STATUS_OPEN:
-            notes.append("还没兑现")
-        elif tag in ("已兑现", "放弃"):
-            notes.append(tag)
-        elif tag.startswith("游戏 "):
-            notes.append(tag[3:].strip())
-        elif tag.startswith("来自 "):
-            notes.append(tag)
-    return f"（{'，'.join(notes)}）" if notes else ""
+        其余条目本来就在 Amaidesu 本地笔记里（旧版本每次读写都同步到本地），不用搬。
+        """
 
-
-def _strip_tags(body: str) -> Tuple[str, List[str]]:
-    """一行正文拆成（去掉标签的正文, 标签列表）。"""
-
-    match = _TAG_BLOCK.search(body)
-    if match is None:
-        return body.strip(), []
-    tags = [part.strip() for part in match.group(1).split("·") if part.strip()]
-    return body[: match.start()].strip(), tags
-
-
-def _section_bodies(lines: List[str], section: str) -> List[str]:
-    bodies: List[str] = []
-    current = ""
-    for raw in lines:
-        line = raw.strip()
-        if line.startswith("## "):
-            current = line[3:].strip()
-        elif current == section and line:
-            bodies.append(line[2:].strip() if line[:2] in ("- ", "* ") else line)
-    return bodies
-
-
-def _append_to_section(lines: List[str], section: str, new_line: str) -> List[str]:
-    """把一行加到某节末尾；没有这一节时作为第一节插在说明文字之后（与 Amaidesu 的节序一致）。"""
-
-    header = f"## {section}"
-    stripped = [line.strip() for line in lines]
-    if header in stripped:
-        end = stripped.index(header) + 1
-        while end < len(lines) and not stripped[end].startswith("## "):
-            end += 1
-        while end > 0 and not stripped[end - 1]:
-            end -= 1  # 插在这一节最后一条之后，不插到节间空行后面
-        return [*lines[:end], new_line, *lines[end:]]
-    first = next((index for index, line in enumerate(stripped) if line.startswith("## ")), len(lines))
-    before = lines[:first]
-    while before and not before[-1].strip():
-        before.pop()
-    block = [header, new_line]
-    rest = lines[first:]
-    return [*before, *([""] if before else []), *block, *([""] if rest else []), *rest]
+        assert self._dir is not None
+        legacy = self._dir / _LEGACY_FILE
+        if not legacy.exists():
+            return
+        try:
+            lines = legacy.read_bytes().decode("utf-8-sig").splitlines()
+            moved = 0
+            for line in lines:
+                match = _LEGACY_PROMISE.match(line.strip())
+                if match is None:
+                    continue
+                tags = [part.strip() for part in match.group(2).split("·")]
+                source = next((tag[3:].strip() for tag in tags if tag.startswith("来自 ")), "")
+                text = _clean_promise(match.group(1))
+                if source and "未兑现" in tags and text and all(item.text != text for item in self._promises):
+                    self._append(text, source=source, where="")
+                    moved += 1
+            os.replace(legacy, legacy.with_name("MEMORY.legacy.md"))
+            self._logger.info(f"旧版共享笔记已改名为 MEMORY.legacy.md，搬了 {moved} 件 QQ 记下的约定进待收清单")
+        except Exception as exc:
+            self._logger.error(f"处理旧版共享笔记失败（{legacy}），原文件保留: {exc}")
 
 
 def _clean_promise(content: str) -> str:
-    """约定正文压成一行：去掉换行、行首的列表符号与标签括号（免得伪造标签）。"""
+    """约定正文压成一行：去掉换行、行首的列表符号，标签括号换成普通括号（免得混进 Amaidesu 的标签）。"""
 
     text = re.sub(r"\s+", " ", str(content or "")).strip()
     text = text.replace("〔", "（").replace("〕", "）")

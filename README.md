@@ -2,7 +2,7 @@
 
 让 Amaidesu 的直播主播和常驻 QQ 的麦麦互通：主播能读 QQ 群、托 QQ 麦麦在群里说话；QQ 麦麦
 知道自己在直播那边正在播什么、刚播完什么、以前每一场做了什么；主播的长期笔记（答应过的事、
-老梗、长线目标、关于我自己）两边共用一份，QQ 里答应的事直播那边也知道。MaiBot 7×24 运行，
+老梗、长线目标、关于我自己）由 Amaidesu 发布给 QQ 麦麦看，QQ 里答应的事直播那边也知道。MaiBot 7×24 运行，
 Amaidesu 用时才启动，所以由本插件在 MaiBot 插件进程里开一个服务（MCP 用 Streamable HTTP，
 另有两个 JSON 接口），Amaidesu 按需连入。
 
@@ -93,25 +93,30 @@ Amaidesu 开启 `[maibot_sync]` 后，把开播、换环节、收播与场次回
 
 ## 共享笔记
 
-主播的长期笔记里"身份"那一层——答应过的事、老梗与口头禅、长线目标、关于我自己——两边都用时
-正本放在这里（插件数据目录的 `notes/MEMORY.md`，每次写入在 `notes/history.jsonl` 留底，留最近 30 条）。
-Amaidesu 开播前经 `/notes`（同一端口、同一令牌）拉取，收播整理后带版本号推回；MaiBot 没开时
-Amaidesu 用本地缓存照常开播，之后自动补推。只用 Amaidesu 时这份不存在。
+主播的长期笔记里"身份"那一层——答应过的事、老梗与口头禅、长线目标、关于我自己——正本只有一份，
+在 Amaidesu 本地，格式也只归 Amaidesu 管。两边只交换"发布出来的东西"，插件不认识笔记格式：
 
+- **发布**：Amaidesu 每次写完正式场的笔记、以及启动时，把它自己挑好、渲染好的"给 QQ 麦麦看的笔记"
+  （不含"不确定""搁置"两节和答应某位直播观众的条目，去掉标签）推过来；插件原样存进数据目录的
+  `notes/published.md`，原样注入。MaiBot 没开时 Amaidesu 照常开播，之后自动补推。
 - **注入**（`notes.inject_planner` / `notes.inject_replyer`）：白名单群的规划请求里，笔记插在系统提示词
-  之后、聊天记录之前（整份不常变，吃得上前缀缓存）；回复请求经 `extra_prompt` 附上。只给上面四节与人
-  自己加的节，去掉标签；"不确定""搁置"两节和答应某位直播观众的条目（标签 `对 昵称#编号`）不给。
-- **记约定**（`notes.record_tool`）：`record_promise` 把一句话追加到"答应过的事"末尾，标
-  `〔未兑现 · 来自 QQ群〕`。限长 `notes.max_promise_chars`（默认 80 字）、同一句不重复记、QQ 记下而
-  未兑现的最多 `notes.max_open_qq_promises` 件（默认 10），正文里的标签括号会被换掉。白名单外的会话
-  里，这个工具会从规划候选里拿掉，被调到也拒绝。之后的整理、淡出、标兑现都由 Amaidesu 收播时做。
-- **接口** `POST /notes`：`{"action": "get"}` 取全文；`{"action": "put", "text", "expected_version", "reason",
-  "changes"}` 整份写，版本对不上回 409（Amaidesu 会重读重做）。版本号 = 全文去掉首尾空白后按 UTF-8
-  取 SHA-1，与 Amaidesu 同一算法。
-- **名字核对**：Amaidesu 每次请求都带上主播人设里的名字，插件与 `bot.nickname`、`bot.alias_names` 比对，
-  结果放进应答（`names.match`）；对不上时两边日志各告警一次，请手动对齐。人设本身不同步。
+  之后、聊天记录之前（整份不常变，吃得上前缀缓存）；回复请求经 `extra_prompt` 附上。
+- **记约定**（`notes.record_tool`）：`record_promise` 把一句话记进插件自己的待收清单
+  （`notes/promises.json`），注入时和笔记一起给 QQ 麦麦看，记下当场就看得到。限长
+  `notes.max_promise_chars`（默认 80 字）、同一句不重复记、待收的最多 `notes.max_open_qq_promises` 件
+  （默认 10）。白名单外的会话里，这个工具会从规划候选里拿掉，被调到也拒绝。
+- **收约定**：Amaidesu 启动时与写笔记前来取待收清单，按它自己的规则并进笔记（标"来自 QQ群"），发布
+  新版本后回报"已收"，插件再从清单里删掉。之后的整理、淡出、标兑现都由 Amaidesu 收播时做。
+- **接口** `POST /notes`（同一端口、同一令牌）：`{"action": "publish", "text"}` 整份替换发布的文字；
+  `{"action": "promises"}` 取待收清单（每件带 `id`、`text`、`source`）；`{"action": "ack", "ids"}` 按编号
+  删掉已收的约定。旧版 Amaidesu 用的 `get` / `put` 回 400，提示升级。
+- **名字核对**：Amaidesu 每次请求都带上主播人设里的名字（`persona_name`），插件与 `bot.nickname`、
+  `bot.alias_names` 比对，结果放进应答（`names.match`）；对不上时两边日志各告警一次，请手动对齐。
+  人设本身不同步。
 
-笔记格式由 Amaidesu 定义，插件只认节名、`对 …#编号`、`来自 …` 与约定状态这几样；格式变了两边要一起改。
+只用 Amaidesu 时这两份都不存在。从旧版本（插件存整份笔记正本 `notes/MEMORY.md`）升级时，旧文件里
+QQ 记下、还没兑现的约定会搬进待收清单，旧文件改名为 `MEMORY.legacy.md` 留底；其余条目本来就在
+Amaidesu 本地，不用搬。
 
 ## 开播提示
 
@@ -241,8 +246,8 @@ manifest 里 `plugin_type = "adapter"`：本插件和 SnowLuma 等适配器一�
 - 改插件目录里任何 `.py` 或 `_manifest.json`（包括 `tests/` 里的）都会让 MaiBot 重启**全部**插件运行
   进程，QQ 适配器也会跟着重连。MaiBot 常驻运行时，改代码最好挑没人聊天的时候。
 - Amaidesu 侧的 MCP 连接在插件重启期间调用会失败一次，下一次调用时自动重连；整场记录与近况推送
-  失败会按 5 秒、30 秒、2 分钟重试（插件明确拒收时不重试）；共享笔记推不上去时先存在 Amaidesu 本地，
-  按 30 秒、2 分钟、10 分钟补推。
+  失败会按 5 秒、30 秒、2 分钟重试（插件明确拒收时不重试）；共享笔记发布不上去时按 30 秒、2 分钟、
+  10 分钟补推，笔记本身一直在 Amaidesu 本地，不受影响。
 
 ## 开发
 
