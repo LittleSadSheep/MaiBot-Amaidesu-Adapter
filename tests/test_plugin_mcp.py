@@ -55,7 +55,7 @@ def test_plugin_serves_tools_over_mcp_and_restores_on_unload() -> None:
         host = FakeHost()
         host.adjust[STREAM_ID] = 0.7
         port = free_port()
-        plugin = make_plugin(host, make_config(port))
+        plugin = make_plugin(host, make_config(port, direct_send=True))
         await plugin.on_load()
         url = f"http://127.0.0.1:{port}/mcp"
         try:
@@ -103,13 +103,21 @@ def test_config_update_restarts_server_only_when_endpoint_changes() -> None:
         url = f"http://127.0.0.1:{port}/mcp"
         try:
             first_server = plugin._server
-            plugin.set_plugin_config(make_config(port, max_text_length=2))
+            # 默认群里只留 QQ 麦麦一张嘴：工具清单不给发群，发来也拒绝。
+            tools, results = await call_tools(url, TOKEN, [("send_group", {"text": "开播啦"})])
+            assert "send_group" not in {tool.name for tool in tools.tools}
+            assert results[0].isError and "ask_mai" in results[0].content[0].text
+            assert host.calls_of("send.text") == []
+
+            # 打开直接发群属于热更新：服务不重启，工具清单与字数上限立即生效。
+            plugin.set_plugin_config(make_config(port, direct_send=True, max_text_length=2))
             await plugin.on_config_update("self", {}, "1.0.0")
             assert plugin._server is first_server
-            _, results = await call_tools(url, TOKEN, [("send_group", {"text": "三个字"})])
+            tools, results = await call_tools(url, TOKEN, [("send_group", {"text": "三个字"})])
+            assert "send_group" in {tool.name for tool in tools.tools}
             assert results[0].isError and "超过上限 2 字" in results[0].content[0].text
 
-            plugin.set_plugin_config(make_config(port, token="rotated"))
+            plugin.set_plugin_config(make_config(port, token="rotated", direct_send=True))
             await plugin.on_config_update("self", {}, "1.0.0")
             assert plugin._server is not first_server
             tools, _ = await call_tools(url, "rotated", [])

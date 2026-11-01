@@ -1,4 +1,4 @@
-"""读群、发群、请 QQ 麦麦说话与发言权接管的业务测试。"""
+"""读群、托 QQ 麦麦说话，以及打开直接发群时的发群与发言权接管的业务测试。"""
 
 from typing import Any, Tuple
 
@@ -79,9 +79,9 @@ def test_group_whitelist_and_missing_stream_are_reported() -> None:
     assert failed and "不在允许名单" in text and GROUP_ID in text
 
     del host.streams[GROUP_ID]
-    text, failed = run(bridge.call_tool("send_group", {"text": "hi"}))
+    text, failed = run(bridge.call_tool("ask_mai", {"intent": "喊人"}))
     assert failed and "还没有群" in text
-    assert host.calls_of("send.text") == []
+    assert host.calls_of("maisaka.proactive.trigger") == []
 
     empty, _, _ = make_bridge()
     empty.update_settings(BridgeSettings(group_ids=()))
@@ -89,8 +89,19 @@ def test_group_whitelist_and_missing_stream_are_reported() -> None:
     assert failed and "还没有配置" in text
 
 
-def test_send_syncs_to_maibot_history_and_takes_over_group() -> None:
+def test_direct_send_off_hides_send_tool_and_rejects_send() -> None:
     bridge, host, _ = make_bridge()
+    assert "send_group" not in {item.name for item in bridge.tool_definitions()}
+
+    # 按旧工具清单发来的发群调用也挡住，并指给主播托话这条路；不发消息、不碰发言频率。
+    text, failed = run(bridge.call_tool("send_group", {"text": "大家好"}))
+    assert failed and "ask_mai" in text
+    assert host.calls_of("send.text") == []
+    assert host.calls_of("frequency.get_adjust") == [] and host.calls_of("frequency.set_adjust") == []
+
+
+def test_send_syncs_to_maibot_history_and_takes_over_group() -> None:
+    bridge, host, _ = make_bridge(direct_send=True)
     host.adjust[STREAM_ID] = 0.8
 
     reply = run(bridge.send_group("大家晚上好，我开播啦"))
@@ -104,7 +115,7 @@ def test_send_syncs_to_maibot_history_and_takes_over_group() -> None:
 
 
 def test_takeover_renews_on_each_send_and_restores_after_expiry() -> None:
-    bridge, host, clock = make_bridge(takeover_duration_ms=10 * MINUTE_MS, min_send_interval_ms=0)
+    bridge, host, clock = make_bridge(direct_send=True, takeover_duration_ms=10 * MINUTE_MS, min_send_interval_ms=0)
     host.adjust[STREAM_ID] = 0.8
     run(bridge.send_group("第一句"))
     clock.advance(8 * MINUTE_MS)
@@ -124,7 +135,7 @@ def test_takeover_renews_on_each_send_and_restores_after_expiry() -> None:
 
 
 def test_send_guards_length_interval_and_failure() -> None:
-    bridge, host, clock = make_bridge(max_text_length=5, min_send_interval_ms=2000)
+    bridge, host, clock = make_bridge(direct_send=True, max_text_length=5, min_send_interval_ms=2000)
     text, failed = run(bridge.call_tool("send_group", {"text": "这句话超过五个字"}))
     assert failed and "超过上限 5 字" in text
 
@@ -134,7 +145,7 @@ def test_send_guards_length_interval_and_failure() -> None:
     assert failed and "1500 毫秒后再发" in text
     assert len(host.calls_of("send.text")) == 1
 
-    other, other_host, _ = make_bridge()
+    other, other_host, _ = make_bridge(direct_send=True)
     other_host.send_ok = False
     text, failed = run(other.call_tool("send_group", {"text": "发不出去"}))
     assert failed and "没能发到" in text
@@ -143,7 +154,7 @@ def test_send_guards_length_interval_and_failure() -> None:
 
 
 def test_unreadable_adjust_skips_takeover_but_message_still_sent() -> None:
-    bridge, host, _ = make_bridge()
+    bridge, host, _ = make_bridge(direct_send=True)
     host.get_adjust_fails = True
     reply = run(bridge.send_group("你好"))
     assert reply.startswith("已发到") and "少说话" not in reply
@@ -151,19 +162,19 @@ def test_unreadable_adjust_skips_takeover_but_message_still_sent() -> None:
 
 
 def test_takeover_disabled_never_touches_frequency() -> None:
-    bridge, host, _ = make_bridge(takeover_enabled=False)
+    bridge, host, _ = make_bridge(direct_send=True, takeover_enabled=False)
     run(bridge.send_group("你好"))
     assert host.calls_of("frequency.get_adjust") == [] and host.calls_of("frequency.set_adjust") == []
 
 
 def test_ask_mai_returns_voice_before_waking_qq_mai() -> None:
-    bridge, host, _ = make_bridge()
+    bridge, host, _ = make_bridge(direct_send=True)
     host.adjust[STREAM_ID] = 0.6
     run(bridge.send_group("我先聊两句"))
     assert host.adjust[STREAM_ID] == 0.0
 
     reply = run(bridge.ask_mai("开播了，喊大家来看，直播间 https://live.bilibili.com/1"))
-    assert "已请 QQ 那边的你" in reply
+    assert "已托 QQ 那边的你" in reply and "下次读群" in reply
     assert host.adjust[STREAM_ID] == 0.6
     # 还原发言权必须发生在唤醒之前，否则倍率为 0 时 QQ 麦麦可能不出声。
     names = [name for name, _ in host.calls]
@@ -181,9 +192,55 @@ def test_ask_mai_reports_trigger_refusal() -> None:
     text, failed = run(bridge.call_tool("ask_mai", {"intent": "喊人"}))
     assert failed and "适配器策略拒绝" in text
 
+    # 唤醒失败不算托过，主播可以马上重试。
+    host.trigger_result = {"success": True, "stream_id": STREAM_ID, "task_id": "t2", "queued": True}
+    text, failed = run(bridge.call_tool("ask_mai", {"intent": "喊人"}))
+    assert not failed
+
+
+def test_ask_mai_waits_between_requests_to_same_group() -> None:
+    bridge, host, clock = make_bridge(min_ask_interval_ms=MINUTE_MS)
+    run(bridge.ask_mai("开播了，喊大家来看"))
+
+    clock.advance(20_000)
+    text, failed = run(bridge.call_tool("ask_mai", {"intent": "再喊一遍"}))
+    assert failed and "40 秒后再托" in text
+    assert len(host.calls_of("maisaka.proactive.trigger")) == 1
+
+    clock.advance(40_000)
+    text, failed = run(bridge.call_tool("ask_mai", {"intent": "再喊一遍"}))
+    assert not failed
+    assert len(host.calls_of("maisaka.proactive.trigger")) == 2
+
+
+def test_ask_mai_must_say_raises_priority() -> None:
+    bridge, host, _ = make_bridge(min_ask_interval_ms=0)
+    run(bridge.call_tool("ask_mai", {"intent": "开播了，直播间 https://live.bilibili.com/1", "must_say": "true"}))
+    run(bridge.call_tool("ask_mai", {"intent": "随便聊聊今天的直播"}))
+
+    urgent, casual = host.calls_of("maisaka.proactive.trigger")
+    assert urgent["priority"] == "高" and "一定在群里说到" in urgent["intent"]
+    assert casual["priority"] == "" and "一定" not in casual["intent"]
+
+    text, failed = run(bridge.call_tool("ask_mai", {"intent": "喊人", "must_say": "maybe"}))
+    assert failed and "must_say" in text
+
+
+def test_turning_direct_send_off_returns_voice_at_once() -> None:
+    bridge, host, _ = make_bridge(direct_send=True)
+    host.adjust[STREAM_ID] = 0.8
+    run(bridge.send_group("我来聊两句"))
+    assert host.adjust[STREAM_ID] == 0.0
+
+    # 接管还没到期，但直接发群被关掉了：下一次到期检查就把发言权还给 QQ 麦麦。
+    bridge.update_settings(BridgeSettings(group_ids=(GROUP_ID,), direct_send=False))
+    run(bridge.expire_takeovers())
+    assert host.adjust[STREAM_ID] == 0.8
+    assert bridge.active_takeovers() == {}
+
 
 def test_release_all_restores_every_group() -> None:
-    bridge, host, _ = make_bridge()
+    bridge, host, _ = make_bridge(direct_send=True)
     host.adjust[STREAM_ID] = 0.9
     run(bridge.send_group("在吗"))
     run(bridge.release_all())
@@ -205,9 +262,20 @@ def test_call_tool_coerces_model_arguments() -> None:
 
 
 def test_tool_definitions_list_configured_groups() -> None:
-    bridge, _, _ = make_bridge(takeover_duration_ms=5 * MINUTE_MS)
+    bridge, _, _ = make_bridge(min_ask_interval_ms=90_000)
+    definitions = {item.name: item for item in bridge.tool_definitions()}
+    assert set(definitions) == {"read_group", "ask_mai", "recall_memory", "recall_person"}
+    ask = definitions["ask_mai"]
+    assert GROUP_ID in ask.input_schema["properties"]["group_id"]["description"]
+    assert ask.input_schema["required"] == ["intent"] and "must_say" in ask.input_schema["properties"]
+    assert "隔 90 秒" in ask.description and "别在直播里说已经发到群里了" in ask.description
+    assert "发言权交还" not in ask.description
+
+
+def test_tool_definitions_with_direct_send_add_send_tool() -> None:
+    bridge, _, _ = make_bridge(direct_send=True, takeover_duration_ms=5 * MINUTE_MS)
     definitions = {item.name: item for item in bridge.tool_definitions()}
     assert set(definitions) == {"read_group", "send_group", "ask_mai", "recall_memory", "recall_person"}
     assert GROUP_ID in definitions["send_group"].input_schema["properties"]["group_id"]["description"]
     assert "约 5 分钟" in definitions["send_group"].description
-    assert definitions["ask_mai"].input_schema["required"] == ["intent"]
+    assert "发言权交还" in definitions["ask_mai"].description

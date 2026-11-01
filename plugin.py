@@ -2,7 +2,8 @@
 
 两个方向：
 - 主播 → QQ：插件在 MaiBot 插件进程里开一个 MCP 服务，Amaidesu 连入后，主播的工具
-  列表里多出读群、发群、请 QQ 麦麦说话三个工具（业务逻辑在 ``bridge.py``）。
+  列表里多出读群、托 QQ 麦麦说话、回想 QQ 那边的记忆等工具（业务逻辑在 ``bridge.py``）。
+  群里默认只有 QQ 麦麦一张嘴，主播亲手发群要另外打开 ``qq.direct_send``。
 - 直播 → QQ 麦麦：Amaidesu 把开播、换环节、收播与场次回顾推到同一端口的
   ``/live-status``，插件缓存后在每次规划与回复前注入近况，并提供查询工具
   （近况逻辑在 ``live_status.py``）。
@@ -91,9 +92,23 @@ class QQConfig(PluginConfigBase):
         ge=60_000,
         description="首次读群（没有已读位置时）回看多久的消息，毫秒",
     )
-    max_text_length: int = Field(default=300, ge=1, le=4000, description="主播单条发群消息的字数上限")
-    min_send_interval_ms: int = Field(default=2000, ge=0, description="同一个群两次发群的最短间隔，毫秒")
-    max_intent_length: int = Field(default=1000, ge=1, le=8000, description="请 QQ 麦麦说话时意图说明的字数上限")
+    direct_send: bool = Field(
+        default=False,
+        description=(
+            "是否给主播直接发群的工具。默认关：群里只留 QQ 麦麦一张嘴，主播想在群里说话就托它说；"
+            "打开后主播能亲手发群，发群后按[水群接管]压低 QQ 麦麦在该群的发言"
+        ),
+    )
+    max_text_length: int = Field(default=300, ge=1, le=4000, description="主播单条发群消息的字数上限（打开直接发群时）")
+    min_send_interval_ms: int = Field(
+        default=2000, ge=0, description="同一个群两次发群的最短间隔，毫秒（打开直接发群时）"
+    )
+    max_intent_length: int = Field(default=1000, ge=1, le=8000, description="托 QQ 麦麦说话时说明的字数上限")
+    min_ask_interval_ms: int = Field(
+        default=60_000,
+        ge=0,
+        description="同一个群两次托 QQ 麦麦说话的最短间隔，毫秒；免得主播每轮都托一次，把 QQ 麦麦刷成复读机",
+    )
     person_lookup_days: int = Field(
         default=30,
         ge=1,
@@ -103,11 +118,13 @@ class QQConfig(PluginConfigBase):
 
 
 class TakeoverConfig(PluginConfigBase):
-    """主播水群期间对 MaiBot 发言频率的接管。"""
+    """主播水群期间对 MaiBot 发言频率的接管（只在打开 qq.direct_send 时起作用）。"""
 
     __ui_label__ = "水群接管"
 
-    enabled: bool = Field(default=True, description="主播发群后是否压低 MaiBot 在该群的发言频率")
+    enabled: bool = Field(
+        default=True, description="主播发群后是否压低 MaiBot 在该群的发言频率；没打开直接发群时不起作用"
+    )
     talk_adjust: float = Field(
         default=0.0,
         ge=0.0,
@@ -263,7 +280,9 @@ def build_bridge_settings(config: AmaidesuAdapterConfig) -> BridgeSettings:
         max_text_length=config.qq.max_text_length,
         min_send_interval_ms=config.qq.min_send_interval_ms,
         max_intent_length=config.qq.max_intent_length,
+        min_ask_interval_ms=config.qq.min_ask_interval_ms,
         person_lookup_days=config.qq.person_lookup_days,
+        direct_send=config.qq.direct_send,
         takeover_enabled=config.takeover.enabled,
         takeover_talk_adjust=config.takeover.talk_adjust,
         takeover_duration_ms=config.takeover.duration_ms,

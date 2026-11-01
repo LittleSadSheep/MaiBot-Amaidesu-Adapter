@@ -1,13 +1,15 @@
 """Amaidesu 主播使用的 QQ 群能力。
 
 直播那边的麦麦（Amaidesu 主播）通过本插件的 MCP 服务调用这些事：
-读群（看看群里在聊什么）、发群（直播时水群）、请 QQ 麦麦说话（交代意图，
-由常驻 QQ 的麦麦用自己的群聊语气表达，例如开播前喊人），以及回想 QQ 那边
-记下的事和对某个群友的印象（逻辑在 ``recall.py``）。所有操作只限允许名单里的群。
+读群（看看群里在聊什么）、托 QQ 麦麦说话（交代要说的事，由常驻 QQ 的麦麦
+用自己的群聊语气表达，例如开播前喊人），以及回想 QQ 那边记下的事和对某个
+群友的印象（逻辑在 ``recall.py``）。所有操作只限允许名单里的群。
 
-同一个 QQ 号背后有两个决策循环：主播在直播里水群时，MaiBot 自己的群聊循环
-也在看同一个群。为避免两边抢话，主播发群后本模块会在一段时间内压低 MaiBot
-在该群的发言频率（接管），到期、主播改请 QQ 麦麦说话或插件卸载时还原。
+群里默认只有 QQ 麦麦一张嘴：群聊的上下文、对群友的了解、在这个群的说话方式都在
+MaiBot 里，主播只负责"说什么、为什么"，"怎么说、什么时候说"交给 QQ 麦麦。
+打开直接发群（``direct_send``）后主播才能亲手发群；这时同一个群有两方以麦麦的
+名义说话，本模块在主播发群后一段时间内压低 MaiBot 在该群的发言频率（接管），
+到期、主播改托 QQ 麦麦说话、直接发群被关掉或插件卸载时还原。
 """
 
 from dataclasses import dataclass, field
@@ -37,7 +39,9 @@ class BridgeSettings:
     max_text_length: int = 300
     min_send_interval_ms: int = 2000
     max_intent_length: int = 1000
+    min_ask_interval_ms: int = 60_000
     person_lookup_days: int = 30
+    direct_send: bool = False
     takeover_enabled: bool = True
     takeover_talk_adjust: float = 0.0
     takeover_duration_ms: int = 10 * 60 * 1000
@@ -93,7 +97,7 @@ def _failure_reason(result: Any) -> str:
 
 
 class QQBridge:
-    """读群、发群、请 QQ 麦麦说话，以及水群期间的发言权接管。
+    """读群、托 QQ 麦麦说话，以及打开直接发群时的发群与发言权接管。
 
     ``ctx`` 是 MaiBot SDK 注入的插件上下文（只用到 chat / message / send /
     frequency / maisaka / config 六组能力），测试中可替换为假实现。
@@ -115,6 +119,9 @@ class QQBridge:
         self._read_cursors: Dict[str, int] = {}
         # 每个群聊流最近一次发群时刻（毫秒），用于限制发送间隔。
         self._last_send_ms: Dict[str, int] = {}
+        # 每个群聊流最近一次成功托 QQ 麦麦说话的时刻（毫秒）：主播每轮决策都托一次
+        # 会把 QQ 麦麦刷成复读机，所以同一个群要隔一段时间才能再托。
+        self._last_ask_ms: Dict[str, int] = {}
         self._takeovers: Dict[str, _Takeover] = {}
         self._takeover_lock = asyncio.Lock()
 
@@ -123,14 +130,14 @@ class QQBridge:
         return self._settings
 
     def update_settings(self, settings: BridgeSettings) -> None:
-        """热更新运行参数；已读位置与进行中的接管保持不变。"""
+        """热更新运行参数；已读位置与进行中的接管保持不变（直接发群被关掉时由到期检查一并还原）。"""
 
         self._settings = settings
 
     # ──── 工具清单与分发 ────────────────────────────────────
 
     def tool_definitions(self) -> List[_ToolDefinition]:
-        """按当前配置生成工具定义：可用群号写进说明，模型不用猜。"""
+        """按当前配置生成工具定义：可用群号写进说明，模型不用猜；没打开直接发群就不给发群工具。"""
 
         settings = self._settings
         groups_text = "、".join(settings.group_ids) if settings.group_ids else "（尚未配置）"
@@ -139,11 +146,7 @@ class QQBridge:
             "type": "string",
             "description": f"QQ 群号，可用：{groups_text}；不填则用默认群 {default_group}",
         }
-        takeover_hint = ""
-        if settings.takeover_enabled:
-            minutes = max(1, round(settings.takeover_duration_ms / 60000))
-            takeover_hint = f"发出后约 {minutes} 分钟内，QQ 那边的你在这个群会少说话，由你来聊，避免两个你抢话。"
-        return [
+        definitions = [
             _ToolDefinition(
                 name="read_group",
                 description=(
@@ -169,31 +172,22 @@ class QQBridge:
                 },
             ),
             _ToolDefinition(
-                name="send_group",
-                description=(
-                    "用你自己的 QQ 号在 QQ 群里发一条文字消息，适合直播时水群、和群友聊天。"
-                    f"单条不超过 {settings.max_text_length} 字。{takeover_hint}"
-                ),
-                input_schema={
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string", "description": "要发的消息原文"},
-                        "group_id": group_property,
-                    },
-                    "required": ["text"],
-                },
-            ),
-            _ToolDefinition(
                 name="ask_mai",
-                description=(
-                    "请常驻 QQ 的你（QQ 那边的麦麦）在群里自己处理一件事，比如开播前喊大家来看直播。"
-                    "只交代目的和要点（例如直播间链接），怎么说、说不说由 QQ 那边的你按群里的气氛决定。"
-                    "调用后这个群的发言权交还给 QQ 那边的你。"
-                ),
+                description=self._ask_mai_description(),
                 input_schema={
                     "type": "object",
                     "properties": {
-                        "intent": {"type": "string", "description": "想让 QQ 那边的你做什么、要点是什么"},
+                        "intent": {
+                            "type": "string",
+                            "description": "要在群里说的事、为什么说（直播这边的来龙去脉），以及必须带上的事实",
+                        },
+                        "must_say": {
+                            "type": "boolean",
+                            "description": (
+                                "这件事是否一定要在群里说到（如开播喊人、发直播间链接），默认 false；"
+                                "true 时 QQ 那边的你会优先处理、尽量说到，但仍不保证"
+                            ),
+                        },
                         "group_id": group_property,
                     },
                     "required": ["intent"],
@@ -231,6 +225,50 @@ class QQBridge:
                 },
             ),
         ]
+        if settings.direct_send:
+            # 只有打开直接发群时主播才看得到发群工具；默认群里只留 QQ 麦麦一张嘴。
+            takeover_hint = ""
+            if settings.takeover_enabled:
+                minutes = max(1, round(settings.takeover_duration_ms / 60000))
+                takeover_hint = f"发出后约 {minutes} 分钟内，QQ 那边的你在这个群会少说话，由你来聊，避免两个你抢话。"
+            definitions.insert(
+                1,
+                _ToolDefinition(
+                    name="send_group",
+                    description=(
+                        "用你自己的 QQ 号在 QQ 群里发一条文字消息，适合直播时水群、和群友聊天。"
+                        f"单条不超过 {settings.max_text_length} 字。{takeover_hint}"
+                    ),
+                    input_schema={
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": "要发的消息原文"},
+                            "group_id": group_property,
+                        },
+                        "required": ["text"],
+                    },
+                ),
+            )
+        return definitions
+
+    def _ask_mai_description(self) -> str:
+        """托话工具的说明：讲清分工（主播给要点，QQ 麦麦决定怎么说）、结果不确定和间隔。"""
+
+        settings = self._settings
+        parts = [
+            "托 QQ 那边的你（常驻 QQ 的麦麦）在群里说话。群里的话由它来说：它知道群里一直在聊什么、"
+            "认识群友、有自己在这个群的说话方式。想在群里说点什么时用这个工具，交代要说的事和为什么"
+            "（直播这边刚发生了什么它看不到，要写上），以及必须带上的事实（例如直播间链接）；"
+            "不用替它写好原话，怎么说、什么时候说由它决定。",
+            "结果不确定：它可能看群里的气氛决定不说，所以别在直播里说已经发到群里了；"
+            "它说了什么，下次读群时能看到（署名就是你自己）。",
+        ]
+        if settings.min_ask_interval_ms > 0:
+            seconds = -(-settings.min_ask_interval_ms // 1000)
+            parts.append(f"同一个群至少隔 {seconds} 秒才能再托一次。")
+        if settings.direct_send:
+            parts.append("调用后这个群的发言权交还给 QQ 那边的你。")
+        return "".join(parts)
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Tuple[str, bool]:
         """执行一个工具，返回（给模型看的结果文本, 是否失败）。"""
@@ -240,7 +278,7 @@ class QQBridge:
                 text = await self.read_group(
                     group_id=_as_text(arguments.get("group_id")),
                     limit=_as_optional_int(arguments.get("limit")),
-                    only_new=_as_bool(arguments.get("only_new"), default=True),
+                    only_new=_as_bool(arguments.get("only_new"), default=True, field_name="only_new"),
                 )
             elif name == "send_group":
                 text = await self.send_group(
@@ -251,6 +289,7 @@ class QQBridge:
                 text = await self.ask_mai(
                     intent=_as_text(arguments.get("intent")),
                     group_id=_as_text(arguments.get("group_id")),
+                    must_say=_as_bool(arguments.get("must_say"), default=False, field_name="must_say"),
                 )
             elif name == "recall_memory":
                 scope = await self._resolve_group(_as_text(arguments.get("group_id")))
@@ -275,7 +314,7 @@ class QQBridge:
             return f"MaiBot 处理 {name} 时出错：{exc}", True
         return text, False
 
-    # ──── 三个工具 ──────────────────────────────────────────
+    # ──── 读群、发群与托话 ──────────────────────────────────
 
     async def read_group(self, group_id: str = "", limit: Optional[int] = None, only_new: bool = True) -> str:
         """读群：默认从上次已读位置往后读，第一次读回看配置的时间窗口。"""
@@ -341,9 +380,12 @@ class QQBridge:
         return hint + "）"
 
     async def send_group(self, text: str, group_id: str = "") -> str:
-        """发群：校验长度与间隔 → 发送并同步进 MaiBot 群上下文 → 接管该群发言权。"""
+        """发群：确认打开了直接发群 → 校验长度与间隔 → 发送并同步进 MaiBot 群上下文 → 接管该群发言权。"""
 
         settings = self._settings
+        if not settings.direct_send:
+            # 默认群里只留 QQ 麦麦一张嘴：工具清单里已经不给发群，这里再挡住按旧清单发来的调用。
+            raise ToolCallError("直接发群没有打开：群里的话由 QQ 那边的你来说，想在群里说什么请用 ask_mai 托它说")
         content = text.strip()
         if not content:
             raise ToolCallError("消息内容是空的")
@@ -378,8 +420,8 @@ class QQBridge:
             reply += f"接下来约 {minutes} 分钟内 QQ 那边的你在这个群会少说话，由你来聊。"
         return reply
 
-    async def ask_mai(self, intent: str, group_id: str = "") -> str:
-        """请 QQ 麦麦说话：先交还发言权，再唤醒它按意图思考一轮。"""
+    async def ask_mai(self, intent: str, group_id: str = "", must_say: bool = False) -> str:
+        """托 QQ 麦麦说话：校验说明与间隔 → 交还发言权 → 唤醒它按托付思考一轮；必说的事标高优先级。"""
 
         settings = self._settings
         content = intent.strip()
@@ -389,19 +431,37 @@ class QQBridge:
             raise ToolCallError(f"说明有 {len(content)} 字，超过上限 {settings.max_intent_length} 字，请精简")
         target = await self._resolve_group(group_id)
 
+        # 同一个群托得太勤就挡回去：QQ 麦麦每被托一次都会跑一轮规划，主播连着托会让它在群里刷屏。
+        now_ms = self._clock_ms()
+        last_ms = self._last_ask_ms.get(target.stream_id)
+        if last_ms is not None and now_ms - last_ms < settings.min_ask_interval_ms:
+            wait_s = -(-(settings.min_ask_interval_ms - (now_ms - last_ms)) // 1000)
+            raise ToolCallError(f"刚托过 QQ 那边的你，{target.label}请 {wait_s} 秒后再托")
+
         # 先交还发言权：接管期间该群频率被压低（为 0 时 QQ 麦麦只看不说），不还就可能叫不动它。
         async with self._takeover_lock:
             await self._release_locked(target.stream_id)
 
+        # 托话写进 MaiBot 这个群的上下文并强制它跑一轮规划：它带着群聊上下文、对群友的了解和
+        # 自己的说话方式决定怎么说；这条托付留在上下文里，之后它也知道自己为什么说了那句。
+        request = f"直播那边的你托你在这个群里：{content}"
+        if must_say:
+            request += "\n这件事请一定在群里说到，怎么说由你按群里的气氛决定。"
         result = await self._ctx.maisaka.proactive.trigger(
             target.stream_id,
-            f"直播那边的你托你在这个群里：{content}",
+            request,
             reason="amaidesu_request",
+            priority="高" if must_say else "",
             metadata={"source": "amaidesu"},
         )
         if not isinstance(result, dict) or result.get("success") is not True:
             raise ToolCallError(f"没能唤醒 QQ 那边的你：{_failure_reason(result)}")
-        return f"已请 QQ 那边的你在{target.label}处理这件事。怎么说、说不说由它按群里的气氛决定。"
+        # 只有真的托出去了才开始计间隔，唤醒失败时主播可以马上重试。
+        self._last_ask_ms[target.stream_id] = now_ms
+        return (
+            f"已托 QQ 那边的你在{target.label}处理这件事。说不说、怎么说由它按群里的气氛决定，"
+            "它说了什么下次读群时能看到。"
+        )
 
     # ──── 发言权接管 ────────────────────────────────────────
 
@@ -432,11 +492,15 @@ class QQBridge:
             return True
 
     async def expire_takeovers(self) -> None:
-        """还原所有已到期的接管（由插件的后台循环定时调用）。"""
+        """还原所有已到期的接管（由插件的后台循环定时调用）；直接发群被关掉时全部立即还原。"""
 
         async with self._takeover_lock:
             now_ms = self._clock_ms()
-            expired = [stream_id for stream_id, item in self._takeovers.items() if item.expires_at_ms <= now_ms]
+            if not self._settings.direct_send:
+                # 关掉直接发群后主播不会再发群，压着的发言权不用等到期，马上还给 QQ 麦麦。
+                expired = list(self._takeovers)
+            else:
+                expired = [stream_id for stream_id, item in self._takeovers.items() if item.expires_at_ms <= now_ms]
             for stream_id in expired:
                 await self._release_locked(stream_id)
 
@@ -506,11 +570,11 @@ def _as_optional_int(value: Any) -> Optional[int]:
         raise ToolCallError(f"limit 需要是整数，收到的是 {value!r}") from exc
 
 
-def _as_bool(value: Any, *, default: bool) -> bool:
+def _as_bool(value: Any, *, default: bool, field_name: str) -> bool:
     if value is None:
         return default
     if isinstance(value, bool):
         return value
     if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
         return value.strip().lower() == "true"
-    raise ToolCallError(f"only_new 需要是 true 或 false，收到的是 {value!r}")
+    raise ToolCallError(f"{field_name} 需要是 true 或 false，收到的是 {value!r}")
